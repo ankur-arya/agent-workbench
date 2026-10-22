@@ -1,0 +1,10 @@
+# Local-first agent workbench. No Docker.
+# Python 3.10–3.13. Install with:  pip install -r requirements.txt
+openai-agents==0.24.0
+fastapi==0.161.0
+uvicorn[standard]==0.34.2
+pydantic==2.14.1
+PyYAML==6.0.2
+python-dotenv==1.1.1
+httpx==0.28.1
+pytest==8.3.5
