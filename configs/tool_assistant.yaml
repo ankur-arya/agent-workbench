@@ -1,0 +1,62 @@
+name: Tool assistant
+description: One agent with local tools. The default desk assistant uses the calculator
+  and the clock.
+template: tool_assistant
+harness:
+  kind: sync
+  max_turns: 10
+  tracing: false
+  provider: local
+  model: null
+  temperature: 0.2
+  tool_choice: auto
+  parallel_tool_calls: false
+  tool_use_behavior: run_llm_again
+  session_backend: none
+  session_id: null
+  approval: manual
+  eval_mode: sync
+nodes:
+- id: start
+  type: start
+  x: 40.0
+  y: 160.0
+  config: {}
+- id: assistant
+  type: agent
+  x: 300.0
+  y: 120.0
+  config:
+    name: Desk assistant
+    instructions: You answer with the calculator for arithmetic and the clock for
+      the current time.
+    tools:
+    - calculator
+    - clock
+edges:
+- id: e1
+  source: start
+  target: assistant
+  source_handle: out
+  target_handle: in
+tasks:
+- input: What is 2 + 2?
+  expect_contains: '4'
+  expect_exact: null
+  expect_tool: calculator
+  expect_handoff: null
+  expect_guardrail: null
+  expect_status: null
+  similarity_reference: null
+  similarity_threshold: 0.34
+  max_words: null
+- input: What time is it right now?
+  expect_contains: null
+  expect_exact: null
+  expect_tool: clock
+  expect_handoff: null
+  expect_guardrail: null
+  expect_status: null
+  similarity_reference: null
+  similarity_threshold: 0.34
+  max_words: null

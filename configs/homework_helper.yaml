@@ -1,0 +1,171 @@
+name: Homework helper
+description: 'Agent Builder-style flow: guardrail, note, rewrite, state, classify,
+  if/else, file search, and a closing transform.'
+template: homework_helper
+harness:
+  kind: sync
+  max_turns: 10
+  tracing: false
+  provider: local
+  model: null
+  temperature: 0.2
+  tool_choice: auto
+  parallel_tool_calls: false
+  tool_use_behavior: run_llm_again
+  session_backend: none
+  session_id: null
+  approval: manual
+  eval_mode: sync
+nodes:
+- id: start
+  type: start
+  x: 40.0
+  y: 180.0
+  config: {}
+- id: guard
+  type: guardrails
+  x: 240.0
+  y: 160.0
+  config:
+    checks:
+    - pii
+    - jailbreak
+    action: flag
+    source: input
+- id: comment
+  type: note
+  x: 240.0
+  y: 320.0
+  config:
+    text: Rewrite the question, remember it, then route facts to the handbook.
+- id: rewriter
+  type: agent
+  x: 460.0
+  y: 140.0
+  config:
+    name: Rewriter
+    instructions: Rewrite the user question as one clear sentence.
+- id: remember
+  type: set_state
+  x: 700.0
+  y: 140.0
+  config:
+    key: query
+    source: output
+- id: classifier
+  type: agent
+  x: 920.0
+  y: 120.0
+  config:
+    name: Classifier
+    instructions: Classify the question. Use route=facts for policy, handbook, refunds,
+      or vacation. Otherwise route=qa.
+    output_fields:
+    - name: route
+      type: string
+- id: branch
+  type: if_else
+  x: 1160.0
+  y: 160.0
+  config:
+    expression: contains(output, "facts")
+- id: facts
+  type: agent
+  x: 1400.0
+  y: 40.0
+  config:
+    name: Facts
+    instructions: Search the handbook and answer from the passages you find.
+    tools:
+    - file_search
+- id: qa
+  type: agent
+  x: 1400.0
+  y: 280.0
+  config:
+    name: Q&A
+    instructions: Answer the how-to question in one short paragraph.
+- id: format
+  type: transform
+  x: 1640.0
+  y: 160.0
+  config:
+    mode: wrap
+    prefix: Answer
+edges:
+- id: e1
+  source: start
+  target: guard
+  source_handle: out
+  target_handle: in
+- id: e2
+  source: guard
+  target: rewriter
+  source_handle: pass
+  target_handle: in
+- id: e3
+  source: rewriter
+  target: remember
+  source_handle: out
+  target_handle: in
+- id: e4
+  source: remember
+  target: classifier
+  source_handle: out
+  target_handle: in
+- id: e5
+  source: classifier
+  target: branch
+  source_handle: out
+  target_handle: in
+- id: e6
+  source: branch
+  target: facts
+  source_handle: 'true'
+  target_handle: in
+- id: e7
+  source: branch
+  target: qa
+  source_handle: 'false'
+  target_handle: in
+- id: e8
+  source: facts
+  target: format
+  source_handle: out
+  target_handle: in
+- id: e9
+  source: qa
+  target: format
+  source_handle: out
+  target_handle: in
+tasks:
+- input: What is the refund policy?
+  expect_contains: 30 days
+  expect_exact: null
+  expect_tool: file_search
+  expect_handoff: null
+  expect_guardrail: null
+  expect_status: null
+  similarity_reference: null
+  similarity_threshold: 0.34
+  max_words: null
+- input: How do I reset my password?
+  expect_contains: emailed link
+  expect_exact: null
+  expect_tool: null
+  expect_handoff: null
+  expect_guardrail: null
+  expect_status: null
+  similarity_reference: null
+  similarity_threshold: 0.34
+  max_words: null
+- input: My email is ada@example.com
+  expect_contains: null
+  expect_exact: null
+  expect_tool: null
+  expect_handoff: null
+  expect_guardrail: true
+  expect_status: blocked
+  similarity_reference: null
+  similarity_threshold: 0.34
+  max_words: null

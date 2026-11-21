@@ -1,0 +1,49 @@
+name: Custom desk agent
+description: A custom agent declared in YAML. Edit instructions, tools, and the harness.
+template: blank
+harness:
+  kind: sync
+  max_turns: 10
+  tracing: false
+  provider: local
+  model: null
+  temperature: 0.2
+  tool_choice: auto
+  parallel_tool_calls: false
+  tool_use_behavior: run_llm_again
+  session_backend: none
+  session_id: null
+  approval: manual
+  eval_mode: sync
+nodes:
+- id: start
+  type: start
+  x: 40.0
+  y: 160.0
+  config: {}
+- id: agent
+  type: agent
+  x: 300.0
+  y: 120.0
+  config:
+    name: Custom agent
+    instructions: You are a custom desk agent. Use the calculator for arithmetic.
+    tools:
+    - calculator
+edges:
+- id: e1
+  source: start
+  target: agent
+  source_handle: out
+  target_handle: in
+tasks:
+- input: What is 3 + 4?
+  expect_contains: '7'
+  expect_exact: null
+  expect_tool: calculator
+  expect_handoff: null
+  expect_guardrail: null
+  expect_status: null
+  similarity_reference: null
+  similarity_threshold: 0.34
+  max_words: null

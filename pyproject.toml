@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-workbench"
+version = "0.1.0"
+description = "Local-first workbench for building agents on the OpenAI Agents SDK."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "openai-agents==0.24.0",
+  "fastapi==0.161.0",
+  "uvicorn[standard]==0.34.2",
+  "pydantic==2.14.1",
+  "PyYAML==6.0.2",
+  "python-dotenv==1.1.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.5", "httpx==0.28.1"]
+
+[project.scripts]
+agent-workbench = "workbench.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["workbench*"]
+
+[tool.setuptools.package-data]
+workbench = ["corpus/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]

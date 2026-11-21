@@ -1,0 +1,84 @@
+name: Triage handoff
+description: A triage agent hands the conversation to a math tutor or a history tutor.
+template: triage
+harness:
+  kind: sync
+  max_turns: 10
+  tracing: false
+  provider: local
+  model: null
+  temperature: 0.2
+  tool_choice: auto
+  parallel_tool_calls: false
+  tool_use_behavior: run_llm_again
+  session_backend: none
+  session_id: null
+  approval: manual
+  eval_mode: sync
+nodes:
+- id: start
+  type: start
+  x: 40.0
+  y: 180.0
+  config: {}
+- id: triage
+  type: agent
+  x: 280.0
+  y: 140.0
+  config:
+    name: Triage
+    instructions: Hand math questions to the Math Tutor and history questions to the
+      History Tutor.
+- id: math
+  type: agent
+  x: 560.0
+  y: 40.0
+  config:
+    name: Math Tutor
+    instructions: Explain the arithmetic and give the numeric result.
+    handoff_description: Specialist for math, arithmetic, algebra, and numbers.
+- id: history
+  type: agent
+  x: 560.0
+  y: 260.0
+  config:
+    name: History Tutor
+    instructions: Answer history questions in a few sentences.
+    handoff_description: Specialist for history, historical events, and people.
+edges:
+- id: e1
+  source: start
+  target: triage
+  source_handle: out
+  target_handle: in
+- id: e2
+  source: triage
+  target: math
+  source_handle: handoff
+  target_handle: in
+- id: e3
+  source: triage
+  target: history
+  source_handle: handoff
+  target_handle: in
+tasks:
+- input: What is 12 * 9?
+  expect_contains: '108'
+  expect_exact: null
+  expect_tool: null
+  expect_handoff: Math Tutor
+  expect_guardrail: null
+  expect_status: null
+  similarity_reference: null
+  similarity_threshold: 0.34
+  max_words: null
+- input: Who was the first president of the United States?
+  expect_contains: George Washington
+  expect_exact: null
+  expect_tool: null
+  expect_handoff: History Tutor
+  expect_guardrail: null
+  expect_status: null
+  similarity_reference: null
+  similarity_threshold: 0.34
+  max_words: null
