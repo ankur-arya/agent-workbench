@@ -427,6 +427,84 @@ def test_gpt5_models_omit_temperature_and_set_low_effort(monkeypatch: pytest.Mon
     assert classic.model_settings.reasoning is None
 
 
+def test_hosted_web_search_call_is_named_and_billed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents import Agent
+    from agents.items import ToolCallItem
+    from openai.types.responses import ResponseFunctionWebSearch
+
+    from workbench.harness import _events
+
+    raw = ResponseFunctionWebSearch(
+        id="ws_8f3c",
+        type="web_search_call",
+        status="completed",
+        action={"type": "search", "query": "steve jobs statue budapest"},
+    )
+    assert not hasattr(raw, "name")
+    item = ToolCallItem(
+        agent=Agent(name="WebSearchAgent", instructions="You are an agent that can search the web."),
+        raw_item=raw,
+    )
+    assert item.tool_name is None
+
+    class Result:
+        new_items = [item]
+        input_guardrail_results: list[object] = []
+        last_agent = None
+
+    events = _events(Result())
+    assert events == [
+        {
+            "type": "tool",
+            "name": "web_search",
+            "detail": "steve jobs statue budapest",
+        }
+    ]
+
+    dict_item = ToolCallItem(
+        agent=Agent(name="WebSearchAgent", instructions="You are an agent that can search the web."),
+        raw_item={
+            "type": "web_search_call",
+            "id": "ws_dict",
+            "status": "completed",
+            "action": {"type": "search", "queries": ["taj mahal"]},
+        },
+    )
+    dict_events = _events(type("Result", (), {"new_items": [dict_item], "input_guardrail_results": [], "last_agent": None})())
+    assert dict_events[0]["name"] == "web_search"
+    assert dict_events[0]["detail"] == "['taj mahal']"
+
+    monkeypatch.setattr("workbench.bench.openai_api_key", lambda: "sk-test")
+
+    async def fake_workflow(document, user_input, **kwargs):
+        del document, user_input, kwargs
+        return RunOutcome(
+            status="completed",
+            output="The statue is in Budapest.",
+            events=events,
+            last_agent="WebSearchAgent",
+            usage={"requests": 2, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0},
+        )
+
+    monkeypatch.setattr("workbench.bench.arun_workflow", fake_workflow)
+    report = asyncio.run(
+        run_benchmark(
+            "search_agent",
+            provider="openai",
+            limit=1,
+            model="gpt-5-mini",
+            judge_model_name="gpt-5-nano",
+            judge=lambda question, expected, output: (1.0, "matches"),
+        )
+    )
+    row = report["results"][0]
+    assert row["tools"] == ["web_search"]
+    assert row["cost"]["web_search_calls"] == 1
+    assert row["cost"]["web_search_usd"] == "0.010000"
+    assert report["cost"]["web_search_calls"] == 1
+    assert report["cost"]["web_search_usd"] == "0.010000"
+
+
 def test_openai_without_a_key_is_refused() -> None:
     with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
         asyncio.run(run_benchmark("search_agent", provider="openai", limit=1))

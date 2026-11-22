@@ -293,7 +293,7 @@ async def run_benchmark(
         _raise_if_access_error(_failure_text(outcome), model=chosen_model, role="agent")
         graded = grade_outcome(task, outcome)
         agent_usage = dict(outcome.usage or empty_usage())
-        calls = sum(1 for name in graded.get("tools") or [] if name == "web_search")
+        calls = _web_search_calls(graded.get("tools") or [])
         agent_usd = Decimal(0) if chosen_model == "local" else price_tokens(chosen_model, **_token_kwargs(agent_usage))
         call_usd = price_web_search(calls, billable=bill_search)
         judge_usage = empty_usage()
@@ -438,6 +438,15 @@ def _eval_spec(harness: HarnessSpec) -> HarnessSpec:
     if spec.kind == "eval":
         spec.kind = spec.eval_mode
     return spec
+
+
+def _web_search_calls(names: list[Any]) -> int:
+    """Count hosted and local web search calls.
+
+    Hosted ``web_search_call`` items are recorded as ``web_search``. Either name
+    is one billable call.
+    """
+    return sum(1 for name in names if str(name) in {"web_search", "web_search_call"})
 
 
 def _bound_judge(model_name: str) -> Judge:
