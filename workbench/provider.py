@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from agents import ModelSettings, RunConfig
+from openai.types.shared import Reasoning
 from agents.items import ModelResponse, TResponseInputItem, TResponseStreamEvent
 from agents.model_settings import ModelSettings as ModelSettingsType
 from agents.models.interface import Model, ModelProvider, ModelTracing
@@ -151,6 +152,27 @@ def decide(
     return [assistant_message(_prose(user_text, instructions, tool_outputs, earlier=_earlier_user_text(model_input)))]
 
 
+def is_reasoning_model(model: str | None) -> bool:
+    """GPT-5 family models reject sampling params such as temperature."""
+    name = (model or "").strip().lower()
+    return name.startswith("gpt-5")
+
+
+def model_settings_for(spec: HarnessSpec, model_name: str | None) -> ModelSettings:
+    """Build SDK model settings. Reasoning models get effort=low and no temperature."""
+    if is_reasoning_model(model_name):
+        return ModelSettings(
+            tool_choice=spec.tool_choice,
+            parallel_tool_calls=spec.parallel_tool_calls,
+            reasoning=Reasoning(effort="low"),
+        )
+    return ModelSettings(
+        temperature=spec.temperature,
+        tool_choice=spec.tool_choice,
+        parallel_tool_calls=spec.parallel_tool_calls,
+    )
+
+
 def build_run_config(
     spec: HarnessSpec,
     *,
@@ -178,11 +200,8 @@ def build_run_config(
 
     tracing_on = bool(spec.tracing and provider == "openai" and openai_api_key())
     set_tracing_disabled(not tracing_on)
-    settings = ModelSettings(
-        temperature=spec.temperature,
-        tool_choice=spec.tool_choice,
-        parallel_tool_calls=spec.parallel_tool_calls,
-    )
+    model_name = spec.model if isinstance(model, str) else None
+    settings = model_settings_for(spec, model_name)
     return RunConfig(
         model=model,
         model_provider=model_provider,

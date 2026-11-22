@@ -59,11 +59,29 @@ python -m workbench publish --workflow wf_…
 python -m workbench export --template orchestrator --format python
 
 python -m workbench connectors
+
+# Cookbook search-agent benchmark (local provider when no API key is set)
+python -m workbench bench search_agent
 ```
 
 `run` also accepts `--config configs/tool_assistant.yaml`, `--workflow`, `--version`, `--harness`, `--provider local|openai`, and `--session`.
 
 Copy `.env.example` to `.env` only when a harness uses `provider: openai`. The key is read from the environment and is never written into a workflow.
+
+## Cookbook benchmark
+
+`python -m workbench bench search_agent` reproduces the offline dataset evaluation in the OpenAI Cookbook notebook [Evaluating Agents with Langfuse](https://github.com/openai/openai-cookbook/blob/main/examples/agents_sdk/evaluate_agents.ipynb).
+
+That notebook builds an Agents SDK `WebSearchAgent` (`WebSearchTool(search_context_size="high")`, instructions “You are an agent that can search the web.”) and runs it on the first 50 rows of Hugging Face `junzhang1207/search-dataset`. Each answer is scored by a Langfuse LLM-as-a-judge named `correct_answer`, which checks the answer against the dataset’s sample answer. The write-up compares context sizes and reports mean correctness moving from about 0.89 to 0.92 as the context window grows. This command runs the `high` setting. The judge prompt is not in the notebook (it is configured in the Langfuse UI); the prompt in `workbench/bench.py` implements that check and calls `gpt-4o-mini`, the judge model from the notebook’s LLM-as-a-judge section. The agent model defaults to `gpt-4o`, the model in the notebook’s traces. Langfuse tracing itself is not reproduced.
+
+```bash
+python -m workbench bench search_agent
+OPENAI_API_KEY=sk-... python -m workbench bench search_agent --provider openai --model gpt-5-mini --judge-model gpt-5-nano --budget-usd 2 --limit 5
+```
+
+Each task records input, cached input, and output tokens for the agent (Agents SDK run usage) and the judge (Chat Completions usage), plus hosted `web_search` calls at $0.01 each. Prices live in `workbench/pricing.py` (OpenAI pricing page, checked 2026-11-22). `--budget-usd` defaults to 2.00. Before a task starts, spend so far plus a per-task reservation is compared with the cap; the rest of the rows are marked skipped and no further model calls are made. `--limit N` grades a prefix of the slice. `--judge-model` defaults to `gpt-4o-mini`. GPT-5 models are sent with reasoning effort `low` and without `temperature`. A 403 or 404 on a task aborts the run instead of continuing through the dataset. A model with no rate in `workbench/pricing.py` is refused before the first call. Local runs record the same fields with a $0 price.
+
+`benchmarks/search_agent/tasks.jsonl` is the first 50 rows of the dataset’s current `data.jsonl` (929 rows on the dataset card; the notebook’s saved log printed 934). It is the leading slice the notebook uploads, not a further sample. With no `OPENAI_API_KEY`, the command uses the local deterministic provider and a token-recall stand-in for `correct_answer`. Those numbers are not model scores. `--provider openai` is the run that matches the cookbook judge. `--context-size low|medium|high` changes the hosted tool setting the notebook compares.
 
 ## What you get
 
@@ -85,6 +103,7 @@ Copy `.env.example` to `.env` only when a harness uses `provider: openai`. The k
 | `guardrailed` | PII mask and a keyword block on the way in and out. |
 | `homework_helper` | Rewrite, classify, then route. The Agent Builder homework example, locally. |
 | `review` | Human-approval pause before a note is sent. |
+| `web_search_agent` | Cookbook WebSearchAgent. Graded by `bench search_agent`. |
 | `blank` | Start node and one empty agent. |
 
 ### Harnesses
@@ -232,12 +251,13 @@ Sources:
 python -m pytest
 ```
 
-Tests use the local model and a temporary `WORKBENCH_HOME`. `OPENAI_API_KEY` is unset. Coverage includes the expression language, every template’s sample tasks, session memory, tool approval, the human-approval node, the HTTP API (publish, restore, SSE, resume), the CLI, and a custom harness.
+Tests use the local model and a temporary `WORKBENCH_HOME`. `OPENAI_API_KEY` is unset. Coverage includes the expression language, every template’s sample tasks, session memory, tool approval, the human-approval node, the HTTP API (publish, restore, SSE, resume), the CLI, a custom harness, and the cookbook `search_agent` benchmark (local provider).
 
 ## Project layout
 
 ```
 workbench/           SDK wiring, canvas runtime, store, FastAPI, CLI
+benchmarks/          Cookbook datasets (search_agent tasks)
 frontend/            React + Vite SPA
 configs/             YAML workflows
 examples/            custom_agent.py

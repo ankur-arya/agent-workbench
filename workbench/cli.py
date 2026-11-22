@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
+from workbench.bench import format_report, list_benchmarks, run_benchmark
 from workbench.catalog import harness_catalog
 from workbench.document import WorkflowDocument
 from workbench.env import load_env, openai_api_key
@@ -72,6 +75,30 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--reload", action="store_true")
     ui.add_argument("--skip-build", action="store_true")
 
+    bench = sub.add_parser("bench", help="Run a cookbook benchmark dataset through an Agents SDK agent.")
+    bench.add_argument("name", nargs="?", default=None, help="Benchmark id. Omit to list benchmarks.")
+    bench.add_argument("--provider", choices=["auto", "local", "openai"], default="auto")
+    bench.add_argument("--limit", type=int, default=None, help="Grade only the first N dataset rows.")
+    bench.add_argument(
+        "--budget-usd",
+        type=float,
+        default=2.0,
+        help="Stop before a task whose conservative estimate would exceed this spend. Default: 2.00.",
+    )
+    bench.add_argument("--model", default=None, help="Agent model when the provider is openai. Default: gpt-4o.")
+    bench.add_argument(
+        "--judge-model",
+        default=None,
+        help="Model for the correct_answer judge. Default: gpt-4o-mini.",
+    )
+    bench.add_argument(
+        "--context-size",
+        choices=["low", "medium", "high"],
+        default="high",
+        help="WebSearchTool search_context_size. The cookbook comparison uses high.",
+    )
+    bench.add_argument("--json", action="store_true", dest="as_json", help="Print the report as JSON.")
+
     sub.add_parser("demo", help="Run the tool-assistant sample and print the result.")
     return parser
 
@@ -118,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
 
         serve(args.host, args.port, reload=args.reload, skip_build=args.skip_build)
         return 0
+    if args.command == "bench":
+        return _bench(args)
     if args.command == "demo":
         document = get_template("tool_assistant")
         outcome = run_workflow(document, "What is 2 + 2?")
@@ -137,6 +166,9 @@ def _info() -> int:
     print("Harnesses:")
     for item in harness_catalog():
         print(f"  {item['kind']:<12} {item['summary']}")
+    print("Benchmarks:")
+    for item in list_benchmarks():
+        print(f"  {item['id']:<16} {item['summary']}")
     return 0
 
 
@@ -209,6 +241,39 @@ def _eval(args: argparse.Namespace) -> int:
 
 
 def _run_eval_sync(document: WorkflowDocument):
-    import asyncio
-
     return asyncio.run(run_eval(document))
+
+
+def _bench(args: argparse.Namespace) -> int:
+    if not args.name:
+        for item in list_benchmarks():
+            print(f"{item['id']:<16} {item['summary']}")
+            print(f"  {item['source']}")
+        return 0
+    known = {item["id"] for item in list_benchmarks()}
+    if args.name not in known:
+        print(
+            f"Unknown benchmark {args.name!r}. Known benchmarks: {', '.join(sorted(known))}",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        report = asyncio.run(
+            run_benchmark(
+                args.name,
+                provider=args.provider,
+                limit=args.limit,
+                model=args.model,
+                judge_model_name=args.judge_model,
+                context_size=args.context_size,
+                budget_usd=args.budget_usd,
+            )
+        )
+    except (RuntimeError, ValueError, FileNotFoundError, KeyError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(format_report(report))
+    return 1 if report.get("errors") else 0

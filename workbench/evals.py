@@ -2,8 +2,10 @@
 
 Graders follow the dataset grader types that are safe to run locally:
 string check, contains, token similarity, tool and handoff checks, guardrail
-checks, and a word-count check. Model-graded scoring is left to a provider
-that has an API key and is not invoked from this module.
+checks, and a word-count check. `reference_answer` adds a deterministic
+`correct_answer` score (token recall against the sample answer). The model
+judge that replaces it for the cookbook benchmark lives in `workbench.bench`
+and is not invoked from this module.
 """
 
 from __future__ import annotations
@@ -15,8 +17,95 @@ from workbench.document import EvalTask, WorkflowDocument
 from workbench.runtime import RunOutcome, arun_workflow
 
 
+_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "with",
+    "by",
+    "from",
+    "at",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "that",
+    "this",
+    "these",
+    "those",
+    "it",
+    "its",
+    "their",
+    "his",
+    "her",
+    "which",
+    "who",
+    "whom",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+    "into",
+    "over",
+    "after",
+    "before",
+    "about",
+    "than",
+    "then",
+    "also",
+    "not",
+    "but",
+    "if",
+    "because",
+    "while",
+    "during",
+    "between",
+}
+
+
 def tokenize(text: str) -> set[str]:
     return {token for token in re.findall(r"[a-z0-9']+", text.lower()) if token}
+
+
+def content_tokens(text: str) -> list[str]:
+    """Informative tokens: numbers, plus words that are not short stopwords."""
+    tokens = []
+    for token in re.findall(r"[a-z0-9']+", text.lower()):
+        if token.isdigit() or (len(token) >= 4 and token not in _STOPWORDS):
+            tokens.append(token)
+    return tokens
+
+
+def lexical_correct_answer(output: str, reference: str) -> tuple[float, float]:
+    """Binary coverage of a sample answer, plus token recall.
+
+    This is the offline stand-in for the cookbook's LLM `correct_answer`
+    judge. Score is 1 when the normalized sample answer appears in the
+    output, or when at least 80% of its content tokens do.
+    """
+    normalized_reference = " ".join(re.findall(r"[a-z0-9']+", reference.lower()))
+    normalized_output = " ".join(re.findall(r"[a-z0-9']+", output.lower()))
+    if normalized_reference and normalized_reference in normalized_output:
+        return 1.0, 1.0
+    reference_tokens = content_tokens(reference)
+    if not reference_tokens:
+        return 0.0, 0.0
+    output_tokens = set(content_tokens(output))
+    covered = sum(1 for token in reference_tokens if token in output_tokens)
+    recall = covered / len(reference_tokens)
+    return (1.0 if recall >= 0.8 else 0.0), recall
 
 
 def similarity(left: str, right: str) -> float:
@@ -61,6 +150,17 @@ def grade_outcome(task: EvalTask, outcome: RunOutcome) -> dict[str, Any]:
         )
     if task.max_words is not None:
         graders.append(_check("word_count", len(output.split()) <= task.max_words, f"<= {task.max_words}"))
+    if task.reference_answer is not None:
+        score, recall = lexical_correct_answer(output, task.reference_answer)
+        graders.append(
+            {
+                "name": "correct_answer",
+                "passed": score == 1.0,
+                "detail": f"{score:.0f} recall={recall:.2f}",
+                "score": score,
+                "recall": recall,
+            }
+        )
     if not graders:
         graders.append(_check("completed", outcome.status == "completed", outcome.status))
     return {
@@ -70,6 +170,7 @@ def grade_outcome(task: EvalTask, outcome: RunOutcome) -> dict[str, Any]:
         "passed": all(item["passed"] for item in graders),
         "graders": graders,
         "last_agent": outcome.last_agent,
+        "tools": tool_names,
     }
 
 

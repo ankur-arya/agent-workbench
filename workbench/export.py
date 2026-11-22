@@ -7,23 +7,30 @@ from workbench.document import WorkflowDocument
 
 def export_python(document: WorkflowDocument) -> str:
     agents = [node for node in document.nodes if node.type == "agent"]
-    lines = [
-        '"""Exported by agent-workbench. Logic nodes are comments; agent nodes are SDK objects."""',
-        "",
-        "import asyncio",
-        "",
-        "from agents import Agent, Runner, function_tool",
-        "",
-        "",
-    ]
     tool_names: list[str] = []
     for node in agents:
         for name in node.config.get("tools") or []:
             if name not in tool_names:
                 tool_names.append(str(name))
-    if tool_names:
+    hosted_web = any(_hosted_web_size(node) for node in agents)
+    stub_names = [name for name in tool_names if not (name == "web_search" and _web_search_is_hosted(agents))]
+    imports = ["Agent", "Runner"]
+    if hosted_web:
+        imports.append("WebSearchTool")
+    if stub_names:
+        imports.append("function_tool")
+    lines = [
+        '"""Exported by agent-workbench. Logic nodes are comments; agent nodes are SDK objects."""',
+        "",
+        "import asyncio",
+        "",
+        f"from agents import {', '.join(imports)}",
+        "",
+        "",
+    ]
+    if stub_names:
         lines.append("# Built-in tools are reproduced as stubs. Prefer workbench.tools in this repo.")
-        for name in tool_names:
+        for name in stub_names:
             lines.append("@function_tool")
             lines.append(f"def {name}(query: str) -> str:")
             lines.append(f'    """{name}."""')
@@ -35,7 +42,14 @@ def export_python(document: WorkflowDocument) -> str:
     for node in ordered:
         var = _var(node.id)
         config = node.config
-        tools = ", ".join(str(name) for name in config.get("tools") or [])
+        size = _hosted_web_size(node)
+        tool_parts = []
+        for name in config.get("tools") or []:
+            if str(name) == "web_search" and size:
+                tool_parts.append(f'WebSearchTool(search_context_size="{_one_line(size)}")')
+            else:
+                tool_parts.append(str(name))
+        tools = ", ".join(tool_parts)
         handoffs = ", ".join(_var(edge.target) for edge in document.outgoing(node.id, "handoff"))
         as_tools = [edge.target for edge in document.outgoing(node.id, "tool") if document.node(edge.target).type == "agent"]
         tool_expr = f"[{tools}]" if tools else "[]"
@@ -77,6 +91,19 @@ def export_python(document: WorkflowDocument) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _hosted_web_size(node) -> str | None:
+    tools = [str(name) for name in node.config.get("tools") or []]
+    size = node.config.get("search_context_size")
+    if "web_search" in tools and size:
+        return str(size)
+    return None
+
+
+def _web_search_is_hosted(agents) -> bool:
+    users = [node for node in agents if "web_search" in [str(name) for name in node.config.get("tools") or []]]
+    return bool(users) and all(_hosted_web_size(node) for node in users)
 
 
 def _entry_agent(document: WorkflowDocument):

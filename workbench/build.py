@@ -63,8 +63,10 @@ def build_agent(
     instructions = str(config.get("instructions") or "You are a helpful agent.")
     behavior = config.get("tool_use_behavior") or spec.tool_use_behavior
     tool_objs: list[Any] = []
+    context_size = config.get("search_context_size")
     for tool_name in _tool_names(node, document):
-        tool_objs.append(_tool_for(tool_name, spec, connectors))
+        size = str(context_size) if tool_name == "web_search" and context_size else None
+        tool_objs.append(_tool_for(tool_name, spec, connectors, search_context_size=size))
     for edge in document.outgoing(node.id, "tool"):
         target = document.node(edge.target)
         if target.type != "agent":
@@ -115,7 +117,23 @@ def _tool_names(node: Node, document: WorkflowDocument) -> list[str]:
     return names
 
 
-def _tool_for(name: str, spec: HarnessSpec, connectors: list[dict[str, Any]] | None) -> Any:
+def _tool_for(
+    name: str,
+    spec: HarnessSpec,
+    connectors: list[dict[str, Any]] | None,
+    *,
+    search_context_size: str | None = None,
+) -> Any:
+    if name == "web_search" and spec.provider == "openai":
+        from agents import WebSearchTool
+
+        if search_context_size is None:
+            return WebSearchTool()
+        if search_context_size not in {"low", "medium", "high"}:
+            raise ValueError(
+                f"search_context_size must be low, medium, or high, got {search_context_size!r}"
+            )
+        return WebSearchTool(search_context_size=search_context_size)  # type: ignore[arg-type]
     record = _record(name, connectors)
     if record is not None and not record.get("enabled", True):
         raise RuntimeError(f"Connector {name} is disabled in the registry.")

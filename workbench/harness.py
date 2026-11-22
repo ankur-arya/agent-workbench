@@ -40,6 +40,7 @@ class HarnessResult:
     pending: dict[str, Any] | None = None
     error: str | None = None
     deltas: str = ""
+    usage: dict[str, int] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -228,6 +229,7 @@ async def execute(
                     "prompt": "Approve this tool call?",
                 },
                 deltas="".join(deltas),
+                usage=_sdk_usage(result),
             )
 
     output = _stringify(result.final_output)
@@ -237,6 +239,7 @@ async def execute(
         events=_events(result),
         last_agent=result.last_agent.name if result.last_agent else agent.name,
         deltas="".join(deltas),
+        usage=_sdk_usage(result),
     )
 
 
@@ -286,8 +289,8 @@ def _events(result: Any) -> list[dict[str, Any]]:
             events.append(
                 {
                     "type": "tool",
-                    "name": getattr(item, "tool_name", None) or getattr(raw, "name", "tool"),
-                    "detail": str(getattr(raw, "arguments", "")),
+                    "name": _tool_call_name(item, raw),
+                    "detail": _tool_call_detail(raw),
                 }
             )
         elif kind == "tool_call_output_item":
@@ -307,6 +310,55 @@ def _events(result: Any) -> list[dict[str, Any]]:
     if result.last_agent is not None:
         events.append({"type": "agent", "name": result.last_agent.name, "detail": "finished"})
     return events
+
+
+def _field(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def _tool_call_name(item: Any, raw: Any) -> str:
+    """Name a tool call, including hosted web search items that have no ``name``.
+
+    ``ResponseFunctionWebSearch`` items use ``type="web_search_call"`` and do not
+    carry a function name. ``ToolCallItem.tool_name`` is then empty, and a bare
+    ``getattr(raw, "name", "tool")`` records the fallback ``tool``.
+    """
+    resolved = getattr(item, "tool_name", None)
+    if isinstance(resolved, str) and resolved.strip():
+        return resolved
+    raw_name = _field(raw, "name")
+    if isinstance(raw_name, str) and raw_name.strip():
+        return raw_name
+    raw_type = _field(raw, "type")
+    if raw_type == "web_search_call" or type(raw).__name__ == "ResponseFunctionWebSearch":
+        return "web_search"
+    return "tool"
+
+
+def _tool_call_detail(raw: Any) -> str:
+    arguments = _field(raw, "arguments")
+    if arguments:
+        return str(arguments)
+    action = _field(raw, "action")
+    if action is None:
+        return ""
+    query = _field(action, "query")
+    if query:
+        return str(query)
+    queries = _field(action, "queries")
+    if queries:
+        return str(queries)
+    return str(_field(action, "type") or "")
+
+
+def _sdk_usage(result: Any) -> dict[str, int]:
+    """Agents SDK aggregate usage for this run, including resumed state."""
+    from workbench.pricing import usage_from_sdk
+
+    wrapper = getattr(result, "context_wrapper", None)
+    return usage_from_sdk(getattr(wrapper, "usage", None) if wrapper is not None else None)
 
 
 def _stringify(value: Any) -> str:

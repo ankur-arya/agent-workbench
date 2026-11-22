@@ -11,6 +11,7 @@ from workbench.checks import findings_for, mask_pii
 from workbench.document import HarnessSpec, Node, WorkflowDocument
 from workbench.expressions import evaluate
 from workbench.harness import DeltaCallback, HarnessResult, execute
+from workbench.pricing import add_usage, empty_usage
 from workbench.tools import file_search, mcp_stub
 
 _FLOW_HANDLES = {"out", "pass", "true", "false", "body", "done", "approved", "rejected"}
@@ -27,6 +28,7 @@ class RunOutcome:
     harness: str = "sync"
     deltas: str = ""
     report: dict[str, Any] | None = None
+    usage: dict[str, int] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +70,7 @@ async def arun_workflow(
 
     last_agent: str | None = None
     deltas = ""
+    usage: dict[str, int] = empty_usage()
     steps = 0
     while node is not None and steps < 40:
         steps += 1
@@ -189,6 +192,8 @@ async def arun_workflow(
             resume = None
             events.extend([{**event, "node_id": node.id} for event in result.events])
             deltas += result.deltas
+            if result.usage:
+                usage = add_usage(usage, result.usage)
             if result.last_agent:
                 last_agent = result.last_agent
             if result.status == "needs_approval" and result.pending:
@@ -205,6 +210,7 @@ async def arun_workflow(
                     pending=pending,
                     harness=spec.kind,
                     deltas=deltas,
+                    usage=dict(usage),
                 )
             if result.status in {"failed", "blocked"}:
                 return RunOutcome(
@@ -215,6 +221,7 @@ async def arun_workflow(
                     error=result.error,
                     harness=spec.kind,
                     deltas=deltas,
+                    usage=dict(usage),
                 )
             state["output"] = result.output
             node = document.successor(node.id, "out")
@@ -231,6 +238,7 @@ async def arun_workflow(
         last_agent=last_agent,
         harness=spec.kind,
         deltas=deltas,
+        usage=dict(usage),
     )
 
 

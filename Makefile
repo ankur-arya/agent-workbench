@@ -3,7 +3,7 @@ HOST ?= 127.0.0.1
 PORT ?= 8000
 export PYTHONPATH := $(CURDIR)
 
-.PHONY: help install install-dev frontend demo eval info ui test clean
+.PHONY: help install install-dev frontend demo eval bench info ui test clean
 
 help:
 	@echo "Agent workbench — build, preview, and evaluate agents (no Docker)"
@@ -13,6 +13,7 @@ help:
 	@echo "  make ui          Build UI if needed and serve API+UI on :$(PORT)"
 	@echo "  make demo        Run the tool-assistant sample"
 	@echo "  make eval        Grade the built-in template tasks"
+	@echo "  make bench       Run the cookbook search-agent benchmark"
 	@echo "  make test        pytest"
 	@echo "  make clean       Remove local store, caches, frontend dist"
 
@@ -29,6 +30,9 @@ frontend:
 
 demo:
 	$(PYTHON) -m workbench demo
+
+bench:
+	$(PYTHON) -m workbench bench search_agent
 
 eval:
 	$(PYTHON) -m workbench eval --template tool_assistant

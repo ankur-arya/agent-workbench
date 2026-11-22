@@ -55,6 +55,9 @@ class EvalTask(BaseModel):
     similarity_reference: str | None = None
     similarity_threshold: float = 0.34
     max_words: int | None = None
+    # Sample answer for the cookbook correct_answer grader. The benchmark
+    # replaces this local score with an LLM judge when a key is set.
+    reference_answer: str | None = None
 
 
 class Node(BaseModel):
