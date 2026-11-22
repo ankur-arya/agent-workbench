@@ -10,6 +10,15 @@ checked 2026-11-22.
 | gpt-4o-mini | 0.15 | 0.075 | 0.60 |
 | gpt-4.1 | 2.00 | 0.50 | 8.00 |
 | gpt-4.1-mini | 0.40 | 0.10 | 1.60 |
+| gpt-5 | 1.25 | 0.125 | 10.00 |
+| gpt-5-mini | 0.25 | 0.025 | 2.00 |
+| gpt-5-nano | 0.05 | 0.005 | 0.40 |
+| gpt-5.4-mini | 0.75 | 0.075 | 4.50 |
+| gpt-5.4-nano | 0.20 | 0.02 | 1.25 |
+
+The GPT-5 rows are the standard (not batch or priority) prices on that page.
+Reasoning tokens are included in output tokens by the API and are billed at the
+output rate. They are not added a second time.
 
 Web search (including images), the non-preview tool the Agents SDK
 ``WebSearchTool`` calls: $10.00 per 1,000 calls, which is $0.01 per call.
@@ -48,6 +57,11 @@ RATES: dict[str, ModelRates] = {
     "gpt-4o-mini": ModelRates(Decimal("0.15"), Decimal("0.075"), Decimal("0.60")),
     "gpt-4.1": ModelRates(Decimal("2.00"), Decimal("0.50"), Decimal("8.00")),
     "gpt-4.1-mini": ModelRates(Decimal("0.40"), Decimal("0.10"), Decimal("1.60")),
+    "gpt-5": ModelRates(Decimal("1.25"), Decimal("0.125"), Decimal("10.00")),
+    "gpt-5-mini": ModelRates(Decimal("0.25"), Decimal("0.025"), Decimal("2.00")),
+    "gpt-5-nano": ModelRates(Decimal("0.05"), Decimal("0.005"), Decimal("0.40")),
+    "gpt-5.4-mini": ModelRates(Decimal("0.75"), Decimal("0.075"), Decimal("4.50")),
+    "gpt-5.4-nano": ModelRates(Decimal("0.20"), Decimal("0.02"), Decimal("1.25")),
 }
 
 # $10.00 / 1,000 calls.
@@ -71,6 +85,7 @@ def empty_usage() -> dict[str, int]:
         "input_tokens": 0,
         "cached_input_tokens": 0,
         "output_tokens": 0,
+        "reasoning_tokens": 0,
     }
 
 
@@ -80,11 +95,14 @@ def usage_from_sdk(usage: Any) -> dict[str, int]:
         return empty_usage()
     details = getattr(usage, "input_tokens_details", None)
     cached = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+    output_details = getattr(usage, "output_tokens_details", None)
+    reasoning = int(getattr(output_details, "reasoning_tokens", 0) or 0) if output_details is not None else 0
     return {
         "requests": int(getattr(usage, "requests", 0) or 0),
         "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
         "cached_input_tokens": cached,
         "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+        "reasoning_tokens": reasoning,
     }
 
 
@@ -94,11 +112,14 @@ def usage_from_chat_completion(usage: Any) -> dict[str, int]:
         return empty_usage()
     details = getattr(usage, "prompt_tokens_details", None)
     cached = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+    output_details = getattr(usage, "completion_tokens_details", None)
+    reasoning = int(getattr(output_details, "reasoning_tokens", 0) or 0) if output_details is not None else 0
     return {
         "requests": 1,
         "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
         "cached_input_tokens": cached,
         "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "reasoning_tokens": reasoning,
     }
 
 
@@ -114,6 +135,17 @@ def rates_for(model: str) -> ModelRates:
             return RATES[key]
     known = ", ".join(sorted(RATES))
     raise KeyError(f"No price for model {model!r}. Known models: {known}")
+
+
+def billable_output_tokens(output_tokens: int, reasoning_tokens: int = 0) -> int:
+    """Reasoning tokens are output tokens.
+
+    The API includes them in ``output_tokens``. If a usage payload reports more
+    reasoning tokens than output tokens, the extra reasoning is billed too.
+    """
+    output = max(int(output_tokens), 0)
+    reasoning = max(int(reasoning_tokens), 0)
+    return max(output, reasoning)
 
 
 def price_tokens(

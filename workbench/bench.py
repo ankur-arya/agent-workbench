@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
@@ -39,14 +40,17 @@ from workbench.pricing import (
     RATES,
     WEB_SEARCH_USD_PER_CALL,
     add_usage,
+    billable_output_tokens,
     can_afford,
     empty_usage,
     estimate_task_usd,
     money,
     price_tokens,
     price_web_search,
+    rates_for,
     usage_from_chat_completion,
 )
+from workbench.provider import is_reasoning_model
 from workbench.runtime import arun_workflow
 from workbench.templates import get_template
 
@@ -123,8 +127,11 @@ def resolve_provider(requested: str | None) -> str:
     return choice
 
 
-def judge_model() -> str:
-    return os.environ.get("OPENAI_JUDGE_MODEL", JUDGE_MODEL).strip() or JUDGE_MODEL
+def judge_model(explicit: str | None = None) -> str:
+    if explicit and explicit.strip():
+        return explicit.strip()
+    env = os.environ.get("OPENAI_JUDGE_MODEL", "").strip()
+    return env or JUDGE_MODEL
 
 
 def agent_model(explicit: str | None) -> str:
@@ -173,12 +180,24 @@ def parse_judge_payload(text: str) -> tuple[float, str]:
     return float(score), reason
 
 
+class ModelAccessError(RuntimeError):
+    """The provider rejected the credentials or the model. The sweep must stop."""
+
+
+def judge_request_kwargs(model: str) -> dict[str, Any]:
+    """Params that the judge model accepts. GPT-5 rejects temperature."""
+    if is_reasoning_model(model):
+        return {"reasoning_effort": "low"}
+    return {"temperature": 0}
+
+
 def llm_correct_answer(
     question: str,
     expected: str,
     output: str,
     *,
     client: Any | None = None,
+    model: str | None = None,
 ) -> tuple[float, str, dict[str, int]]:
     """Call the cookbook-style correct_answer judge. Requires an API key."""
     if client is None:
@@ -188,14 +207,15 @@ def llm_correct_answer(
         from openai import OpenAI
 
         client = OpenAI(api_key=key)
+    model_name = model or judge_model()
     response = client.chat.completions.create(
-        model=judge_model(),
-        temperature=0,
+        model=model_name,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": JUDGE_SYSTEM},
             {"role": "user", "content": judge_user_prompt(question, expected, output)},
         ],
+        **judge_request_kwargs(model_name),
     )
     text = response.choices[0].message.content or ""
     score, reason = parse_judge_payload(text)
@@ -210,6 +230,7 @@ async def run_benchmark(
     model: str | None = None,
     context_size: str = "high",
     judge: Judge | None = None,
+    judge_model_name: str | None = None,
     budget_usd: Decimal | float | str = DEFAULT_BUDGET_USD,
 ) -> dict[str, Any]:
     if name not in BENCHMARKS:
@@ -223,13 +244,14 @@ async def run_benchmark(
     document.harness.provider = resolved  # type: ignore[assignment]
     document.node("web").config["search_context_size"] = context_size
     chosen_model = "local"
+    chosen_judge = judge_model(judge_model_name)
     judge_name = "local-overlap"
     if resolved == "openai":
         chosen_model = agent_model(model)
         document.harness.model = chosen_model
         if judge is None:
-            judge = llm_correct_answer
-            judge_name = f"openai:{judge_model()}"
+            judge = _bound_judge(chosen_judge)
+            judge_name = f"openai:{chosen_judge}"
         else:
             judge_name = "custom"
     elif judge is not None:
@@ -237,7 +259,11 @@ async def run_benchmark(
 
     budget = _budget(budget_usd)
     bill_search = resolved == "openai"
-    priced_judge = judge_model() if judge is not None and bill_search else None
+    priced_judge = chosen_judge if judge is not None and bill_search else None
+    if bill_search:
+        _require_price(chosen_model)
+        if priced_judge:
+            _require_price(priced_judge)
     estimate = estimate_task_usd(
         agent_model=chosen_model,
         judge_model=priced_judge,
@@ -264,6 +290,7 @@ async def run_benchmark(
             rows.append(_skipped_row(item, budget, spent, estimate))
             continue
         outcome = await arun_workflow(document, item["question"], harness=spec)
+        _raise_if_access_error(_failure_text(outcome), model=chosen_model, role="agent")
         graded = grade_outcome(task, outcome)
         agent_usage = dict(outcome.usage or empty_usage())
         calls = sum(1 for name in graded.get("tools") or [] if name == "web_search")
@@ -277,7 +304,10 @@ async def run_benchmark(
                 judged_score, reason, judge_usage = _judge_parts(
                     judge(item["question"], item["expected_answer"], str(graded.get("output") or ""))
                 )
+            except ModelAccessError:
+                raise
             except Exception as exc:
+                _raise_if_access_error(exc, model=priced_judge or chosen_judge, role="judge")
                 error = str(exc)
                 errors += 1
                 score = None
@@ -350,7 +380,8 @@ async def run_benchmark(
         "model_scores": model_scores,
         "search_context_size": context_size,
         "search_context_applied": bill_search,
-        "temperature": document.harness.temperature,
+        "temperature": None if is_reasoning_model(chosen_model) else document.harness.temperature,
+        "reasoning_effort": "low" if is_reasoning_model(chosen_model) or is_reasoning_model(priced_judge) else None,
         "correct_answer_mean": mean,
         "correct": correct,
         "scored": len(scored_rows),
@@ -409,11 +440,74 @@ def _eval_spec(harness: HarnessSpec) -> HarnessSpec:
     return spec
 
 
+def _bound_judge(model_name: str) -> Judge:
+    def _judge(question: str, expected: str, output: str) -> tuple[float, str, dict[str, int]]:
+        return llm_correct_answer(question, expected, output, model=model_name)
+
+    return _judge
+
+
+def _require_price(model_name: str) -> None:
+    try:
+        rates_for(model_name)
+    except KeyError as exc:
+        known = ", ".join(sorted(RATES))
+        raise ValueError(
+            f"No price for model {model_name!r}, so the run was not started. "
+            f"Known models: {known}."
+        ) from exc
+
+
+def _failure_text(outcome: Any) -> str:
+    parts = [str(getattr(outcome, "error", "") or "")]
+    for event in getattr(outcome, "events", None) or []:
+        if isinstance(event, dict) and event.get("type") == "error":
+            parts.append(str(event.get("name") or ""))
+            parts.append(str(event.get("detail") or ""))
+    return "\n".join(part for part in parts if part)
+
+
+def _raise_if_access_error(error: BaseException | str | None, *, model: str, role: str) -> None:
+    status = _access_status(error)
+    if status is None:
+        return
+    detail = " ".join(str(error or "").split())
+    if len(detail) > 400:
+        detail = detail[:397] + "..."
+    raise ModelAccessError(
+        f"HTTP {status} from the {role} call to {model!r}. "
+        "The benchmark stopped on this error and did not send the remaining tasks. "
+        f"{detail} "
+        "Use a model this project can access, for example "
+        "--model gpt-5-mini --judge-model gpt-5-nano."
+    )
+
+
+def _access_status(error: BaseException | str | None) -> int | None:
+    if error is None:
+        return None
+    code = getattr(error, "status_code", None)
+    if code in (403, 404):
+        return int(code)
+    text = str(error)
+    match = re.search(r"(?:error code:\s*|status(?:_code)?[:=\s]+|http\s+)(403|404)\b", text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    if re.search(r"\b403\s+forbidden\b", text, re.IGNORECASE) or "PermissionDenied" in text:
+        return 403
+    if re.search(r"\b404\s+not found\b", text, re.IGNORECASE) or "NotFoundError" in text:
+        return 404
+    return None
+
+
 def _token_kwargs(usage: dict[str, int]) -> dict[str, int]:
     return {
         "input_tokens": int(usage.get("input_tokens", 0)),
         "cached_input_tokens": int(usage.get("cached_input_tokens", 0)),
-        "output_tokens": int(usage.get("output_tokens", 0)),
+        "output_tokens": billable_output_tokens(
+            int(usage.get("output_tokens", 0)),
+            int(usage.get("reasoning_tokens", 0)),
+        ),
     }
 
 
@@ -488,6 +582,7 @@ def _cost_block(
         "input_tokens": int(usage.get("input_tokens", 0)),
         "cached_input_tokens": int(usage.get("cached_input_tokens", 0)),
         "output_tokens": int(usage.get("output_tokens", 0)),
+        "reasoning_tokens": int(usage.get("reasoning_tokens", 0)),
         "requests": int(usage.get("requests", 0)),
         "web_search_calls": web_search_calls,
         "web_search_usd": money(web_search_usd),
@@ -502,7 +597,11 @@ def _party_cost(model: str, usage: dict[str, int], usd: Decimal) -> dict[str, An
         "requests": int(usage.get("requests", 0)),
         "input_tokens": int(usage.get("input_tokens", 0)),
         "cached_input_tokens": int(usage.get("cached_input_tokens", 0)),
-        "output_tokens": int(usage.get("output_tokens", 0)),
+        "output_tokens": billable_output_tokens(
+            int(usage.get("output_tokens", 0)),
+            int(usage.get("reasoning_tokens", 0)),
+        ),
+        "reasoning_tokens": int(usage.get("reasoning_tokens", 0)),
         "usd": money(usd),
     }
 

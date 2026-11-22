@@ -87,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench.add_argument("--model", default=None, help="Agent model when the provider is openai. Default: gpt-4o.")
     bench.add_argument(
+        "--judge-model",
+        default=None,
+        help="Model for the correct_answer judge. Default: gpt-4o-mini.",
+    )
+    bench.add_argument(
         "--context-size",
         choices=["low", "medium", "high"],
         default="high",
@@ -259,6 +264,7 @@ def _bench(args: argparse.Namespace) -> int:
                 provider=args.provider,
                 limit=args.limit,
                 model=args.model,
+                judge_model_name=args.judge_model,
                 context_size=args.context_size,
                 budget_usd=args.budget_usd,
             )

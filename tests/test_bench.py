@@ -160,10 +160,12 @@ def test_llm_judge_reads_json_and_usage_from_the_client() -> None:
         "input_tokens": 40,
         "cached_input_tokens": 3,
         "output_tokens": 9,
+        "reasoning_tokens": 0,
     }
     sent = client.chat.completions.kwargs
     assert sent["model"] == "gpt-4o-mini"
     assert sent["temperature"] == 0
+    assert "reasoning_effort" not in sent
     assert "Budapest" in sent["messages"][1]["content"]
     assert sent["messages"][0]["content"].startswith("You grade whether")
 
@@ -232,10 +234,11 @@ def test_openai_provider_uses_the_llm_judge(monkeypatch: pytest.MonkeyPatch) -> 
             },
         )
 
-    def fake_judge(question: str, expected: str, output: str):
+    def fake_judge(question: str, expected: str, output: str, model: str | None = None):
         assert output == "stub answer"
         assert expected
         assert question
+        assert model == "gpt-4o-mini"
         return 1.0, "matches the sample", {"requests": 1, "input_tokens": 30, "cached_input_tokens": 10, "output_tokens": 8}
 
     monkeypatch.setattr("workbench.bench.arun_workflow", fake_workflow)
@@ -322,6 +325,106 @@ def test_budget_stops_before_the_next_task_and_never_spends_the_cap(monkeypatch:
     assert blocked["skipped"] == 3
     assert blocked["cost"]["usd"] == "0.000000"
     assert all(row["status"] == "skipped" for row in blocked["results"])
+
+
+def test_unpriced_model_is_refused_before_any_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("workbench.bench.openai_api_key", lambda: "sk-test")
+    calls: list[str] = []
+
+    async def fake_workflow(document, user_input, **kwargs):
+        del document, kwargs
+        calls.append(user_input)
+        return RunOutcome(status="completed", output="x", last_agent="WebSearchAgent", usage={})
+
+    monkeypatch.setattr("workbench.bench.arun_workflow", fake_workflow)
+    with pytest.raises(ValueError, match="No price for model 'gpt-5.2'"):
+        asyncio.run(
+            run_benchmark(
+                "search_agent",
+                provider="openai",
+                limit=3,
+                model="gpt-5.2",
+                judge_model_name="gpt-5-nano",
+            )
+        )
+    assert calls == []
+
+
+def test_model_access_error_aborts_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    from workbench.bench import ModelAccessError
+
+    monkeypatch.setattr("workbench.bench.openai_api_key", lambda: "sk-test")
+    calls: list[int] = []
+
+    async def denied(document, user_input, **kwargs):
+        del document, user_input, kwargs
+        calls.append(1)
+        return RunOutcome(
+            status="failed",
+            output="",
+            error="Error code: 403 - {'error': {'message': 'Project does not have access to model gpt-4o'}}",
+            events=[{"type": "error", "name": "PermissionDeniedError", "detail": "Error code: 403"}],
+            last_agent=None,
+        )
+
+    monkeypatch.setattr("workbench.bench.arun_workflow", denied)
+    with pytest.raises(ModelAccessError, match="HTTP 403"):
+        asyncio.run(run_benchmark("search_agent", provider="openai", limit=4, model="gpt-5-mini", judge_model_name="gpt-5-nano"))
+    assert calls == [1]
+
+    class Missing(Exception):
+        status_code = 404
+
+    async def ok(document, user_input, **kwargs):
+        del document, user_input, kwargs
+        calls.append(2)
+        return RunOutcome(status="completed", output="answer", last_agent="WebSearchAgent", usage={})
+
+    def missing_judge(question: str, expected: str, output: str):
+        del question, expected, output
+        raise Missing("model not found")
+
+    monkeypatch.setattr("workbench.bench.arun_workflow", ok)
+    with pytest.raises(ModelAccessError, match="HTTP 404"):
+        asyncio.run(
+            run_benchmark(
+                "search_agent",
+                provider="openai",
+                limit=3,
+                model="gpt-5-mini",
+                judge_model_name="gpt-5-nano",
+                judge=missing_judge,
+            )
+        )
+    assert calls == [1, 2]
+
+
+def test_gpt5_models_omit_temperature_and_set_low_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    from workbench.bench import judge_request_kwargs
+    from workbench.document import HarnessSpec
+    from workbench.provider import build_run_config
+
+    nano = judge_request_kwargs("gpt-5-nano")
+    assert nano == {"reasoning_effort": "low"}
+    assert "temperature" not in nano
+    assert judge_request_kwargs("gpt-4o-mini") == {"temperature": 0}
+
+    monkeypatch.setattr("workbench.provider.openai_api_key", lambda: "sk-test")
+    spec = HarnessSpec(provider="openai", model="gpt-5-mini", temperature=0.7, tracing=False)
+    config = build_run_config(spec, workflow_name="bench")
+    assert config.model == "gpt-5-mini"
+    assert config.model_settings is not None
+    assert config.model_settings.temperature is None
+    assert config.model_settings.reasoning is not None
+    assert config.model_settings.reasoning.effort == "low"
+
+    classic = build_run_config(
+        HarnessSpec(provider="openai", model="gpt-4o", temperature=0.2, tracing=False),
+        workflow_name="bench",
+    )
+    assert classic.model_settings is not None
+    assert classic.model_settings.temperature == 0.2
+    assert classic.model_settings.reasoning is None
 
 
 def test_openai_without_a_key_is_refused() -> None:

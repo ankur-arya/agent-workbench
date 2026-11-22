@@ -11,6 +11,7 @@ from workbench.checks import findings_for, mask_pii
 from workbench.document import HarnessSpec, Node, WorkflowDocument
 from workbench.expressions import evaluate
 from workbench.harness import DeltaCallback, HarnessResult, execute
+from workbench.pricing import add_usage, empty_usage
 from workbench.tools import file_search, mcp_stub
 
 _FLOW_HANDLES = {"out", "pass", "true", "false", "body", "done", "approved", "rejected"}
@@ -69,12 +70,7 @@ async def arun_workflow(
 
     last_agent: str | None = None
     deltas = ""
-    usage: dict[str, int] = {
-        "requests": 0,
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "output_tokens": 0,
-    }
+    usage: dict[str, int] = empty_usage()
     steps = 0
     while node is not None and steps < 40:
         steps += 1
@@ -197,8 +193,7 @@ async def arun_workflow(
             events.extend([{**event, "node_id": node.id} for event in result.events])
             deltas += result.deltas
             if result.usage:
-                for key in usage:
-                    usage[key] += int(result.usage.get(key, 0))
+                usage = add_usage(usage, result.usage)
             if result.last_agent:
                 last_agent = result.last_agent
             if result.status == "needs_approval" and result.pending:

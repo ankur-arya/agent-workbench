@@ -4,6 +4,7 @@ import pytest
 from agents.usage import Usage
 
 from workbench.pricing import (
+    billable_output_tokens,
     can_afford,
     estimate_task_usd,
     money,
@@ -25,8 +26,22 @@ def test_rates_match_the_pricing_page_and_snapshots() -> None:
     assert rates_for("gpt-4o-mini-2024-07-18").cached_input == Decimal("0.075")
     assert rates_for("gpt-4.1").output == Decimal("8.00")
     assert rates_for("gpt-4.1-mini").cached_input == Decimal("0.10")
+    assert rates_for("gpt-5").input == Decimal("1.25")
+    assert rates_for("gpt-5").cached_input == Decimal("0.125")
+    assert rates_for("gpt-5").output == Decimal("10.00")
+    assert rates_for("gpt-5-2025-08-07").output == Decimal("10.00")
+    assert rates_for("gpt-5-mini").input == Decimal("0.25")
+    assert rates_for("gpt-5-mini").output == Decimal("2.00")
+    assert rates_for("gpt-5-mini").cached_input == Decimal("0.025")
+    assert rates_for("gpt-5-nano").input == Decimal("0.05")
+    assert rates_for("gpt-5-nano").output == Decimal("0.40")
+    assert rates_for("gpt-5-nano").cached_input == Decimal("0.005")
+    assert rates_for("gpt-5.4-mini").input == Decimal("0.75")
+    assert rates_for("gpt-5.4-mini").output == Decimal("4.50")
+    assert rates_for("gpt-5.4-nano").output == Decimal("1.25")
+    assert rates_for("gpt-5.4-nano").cached_input == Decimal("0.02")
     with pytest.raises(KeyError):
-        rates_for("gpt-5")
+        rates_for("gpt-5.2")
 
 
 def test_cached_tokens_are_not_billed_again_as_full_input() -> None:
@@ -43,13 +58,20 @@ def test_cached_tokens_are_not_billed_again_as_full_input() -> None:
 def test_usage_from_sdk_reads_context_usage() -> None:
     usage = Usage(requests=2, input_tokens=1500, output_tokens=250, total_tokens=1750)
     usage.input_tokens_details.cached_tokens = 400
+    usage.output_tokens_details.reasoning_tokens = 80
     parsed = usage_from_sdk(usage)
     assert parsed == {
         "requests": 2,
         "input_tokens": 1500,
         "cached_input_tokens": 400,
         "output_tokens": 250,
+        "reasoning_tokens": 80,
     }
+    # 80 reasoning tokens are already inside the 250 output tokens.
+    assert billable_output_tokens(250, 80) == 250
+    assert price_tokens("gpt-5-nano", input_tokens=0, cached_input_tokens=0, output_tokens=250) == Decimal("0.0001")
+    # A payload that reports reasoning beyond output still bills the reasoning tokens.
+    assert billable_output_tokens(20, 80) == 80
 
 
 def test_local_agent_run_exposes_sdk_usage_without_a_price() -> None:
