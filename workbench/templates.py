@@ -413,6 +413,37 @@ def review(name: str = "") -> WorkflowDocument:
     )
 
 
+def web_search_agent(name: str = "") -> WorkflowDocument:
+    """WebSearchAgent from the cookbook evaluate_agents notebook.
+
+    The agent text matches that notebook's offline evaluation: name
+    ``WebSearchAgent``, instructions ``You are an agent that can search the web.``,
+    and ``WebSearchTool(search_context_size="high")`` when the provider is
+    OpenAI. The graded questions live in ``benchmarks/search_agent``.
+    """
+    return _doc(
+        name or "Web search agent",
+        "Cookbook WebSearchAgent. Searches the web and answers. Grade it with `bench search_agent`.",
+        [
+            Node(id="start", type="start", x=40, y=160),
+            Node(
+                id="web",
+                type="agent",
+                x=300,
+                y=120,
+                config={
+                    "name": "WebSearchAgent",
+                    "instructions": "You are an agent that can search the web.",
+                    "tools": ["web_search"],
+                    "search_context_size": "high",
+                },
+            ),
+        ],
+        [Edge(id="e1", source="start", target="web")],
+        harness=HarnessSpec(temperature=0.7),
+    )
+
+
 def blank(name: str = "") -> WorkflowDocument:
     return _doc(
         name or "Custom agent",
@@ -443,5 +474,6 @@ TEMPLATES = {
     "guardrailed": guardrailed,
     "homework_helper": homework_helper,
     "review": review,
+    "web_search_agent": web_search_agent,
     "blank": blank,
 }

@@ -1,0 +1,267 @@
+import asyncio
+
+import pytest
+from agents.tool import FunctionTool
+
+from workbench.bench import (
+    load_search_tasks,
+    llm_correct_answer,
+    parse_judge_payload,
+    run_benchmark,
+)
+from workbench.build import build_agent
+from workbench.cli import main
+from workbench.document import EvalTask
+from workbench.evals import grade_outcome, lexical_correct_answer
+from workbench.export import export_python
+from workbench.runtime import RunOutcome
+from workbench.templates import get_template
+
+
+def test_dataset_is_the_cookbook_slice() -> None:
+    rows = load_search_tasks()
+    assert len(rows) == 50
+    assert rows[0]["id"] == "20caf138-0c81-4ef9-be60-fe919e0d68d4"
+    assert rows[0]["question"] == "steve jobs statue location budapst"
+    assert rows[0]["expected_answer"].startswith("The Steve Jobs statue is located in Budapest")
+    assert rows[0]["category"] == "Arts"
+    assert rows[0]["area"] == "Knowledge"
+    assert rows[4]["question"] == "What event led to the creation of Google Images?"
+    assert "Jennifer Lopez" in rows[4]["expected_answer"]
+    assert len({row["id"] for row in rows}) == 50
+    assert rows[5]["question"] == "how long does 503 service unavailable last on average"
+
+
+def test_lexical_correct_answer_covers_the_sample_or_its_tokens() -> None:
+    reference = "The Steve Jobs statue is located in Budapest, Hungary."
+    score, recall = lexical_correct_answer(reference, reference)
+    assert score == 1.0
+    assert recall == 1.0
+
+    score, _ = lexical_correct_answer("The year was 1956.", "1956")
+    assert score == 1.0
+    score, _ = lexical_correct_answer("No local passages matched the query.", "1956")
+    assert score == 0.0
+
+    covered = "Steve Jobs statue located Budapest"
+    score, recall = lexical_correct_answer(covered, reference)
+    assert score == 1.0
+    assert recall >= 0.8
+
+    weak = "Steve Jobs statue"
+    score, recall = lexical_correct_answer(weak, reference)
+    assert score == 0.0
+    assert recall < 0.8
+
+
+def test_reference_answer_grader_uses_correct_answer() -> None:
+    task = EvalTask(input="Where is the statue?", reference_answer="Budapest, Hungary.")
+    graded = grade_outcome(task, RunOutcome(status="completed", output="It is in Budapest, Hungary."))
+    assert graded["passed"] is True
+    grader = graded["graders"][0]
+    assert grader["name"] == "correct_answer"
+    assert grader["score"] == 1.0
+
+    missed = grade_outcome(task, RunOutcome(status="completed", output="No local passages matched."))
+    assert missed["passed"] is False
+    assert missed["graders"][0]["score"] == 0.0
+
+
+def test_template_matches_the_cookbook_agent() -> None:
+    document = get_template("web_search_agent")
+    node = document.node("web")
+    assert node.config["name"] == "WebSearchAgent"
+    assert node.config["instructions"] == "You are an agent that can search the web."
+    assert node.config["tools"] == ["web_search"]
+    assert node.config["search_context_size"] == "high"
+    assert document.harness.temperature == 0.7
+
+    document.harness.provider = "openai"
+    hosted = build_agent(node, document, document.harness)
+    assert hosted.name == "WebSearchAgent"
+    assert hosted.tools[0].name == "web_search"
+    assert type(hosted.tools[0]).__name__ == "WebSearchTool"
+    assert hosted.tools[0].search_context_size == "high"
+
+    local_doc = get_template("web_search_agent")
+    local = build_agent(local_doc.node("web"), local_doc, local_doc.harness)
+    assert isinstance(local.tools[0], FunctionTool)
+    assert local.tools[0].name == "web_search"
+
+    exported = export_python(get_template("web_search_agent"))
+    assert 'WebSearchTool(search_context_size="high")' in exported
+    assert "You are an agent that can search the web." in exported
+    assert "function_tool" not in exported
+
+    research = get_template("research")
+    research.harness.provider = "openai"
+    researcher = build_agent(research.node("researcher"), research, research.harness)
+    web = next(tool for tool in researcher.tools if getattr(tool, "name", None) == "web_search")
+    assert type(web).__name__ == "WebSearchTool"
+    assert web.search_context_size == "medium"
+
+
+def test_parse_judge_payload_accepts_binary_json() -> None:
+    score, reason = parse_judge_payload('{"correct_answer": 1, "reason": "agrees"}')
+    assert score == 1.0
+    assert reason == "agrees"
+    score, _ = parse_judge_payload('note {"correct_answer": 0, "reason": "misses the fact"} thanks')
+    assert score == 0.0
+    assert parse_judge_payload('{"correct_answer": true}')[0] == 1.0
+    assert parse_judge_payload('{"correct_answer": false}')[0] == 0.0
+    with pytest.raises(ValueError):
+        parse_judge_payload('{"correct_answer": 0.5}')
+
+
+def test_llm_judge_reads_json_from_the_client() -> None:
+    class Message:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class Choice:
+        def __init__(self, content: str) -> None:
+            self.message = Message(content)
+
+    class Response:
+        def __init__(self, content: str) -> None:
+            self.choices = [Choice(content)]
+
+    class Completions:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        def create(self, **kwargs):
+            self.kwargs = kwargs
+            return Response('{"correct_answer": 1, "reason": "covered"}')
+
+    class Chat:
+        def __init__(self) -> None:
+            self.completions = Completions()
+
+    class Client:
+        def __init__(self) -> None:
+            self.chat = Chat()
+
+    client = Client()
+    score, reason = llm_correct_answer("Where?", "Budapest", "Budapest, Hungary.", client=client)
+    assert score == 1.0
+    assert reason == "covered"
+    sent = client.chat.completions.kwargs
+    assert sent["model"] == "gpt-4o-mini"
+    assert sent["temperature"] == 0
+    assert "Budapest" in sent["messages"][1]["content"]
+    assert sent["messages"][0]["content"].startswith("You grade whether")
+
+
+def test_local_benchmark_scores_every_cookbook_row() -> None:
+    report = asyncio.run(run_benchmark("search_agent", provider="local"))
+    assert report["provider"] == "local"
+    assert report["judge"] == "local-overlap"
+    assert report["model_scores"] is False
+    assert report["total"] == 50
+    assert report["errors"] == 0
+    assert report["search_context_size"] == "high"
+    assert report["search_context_applied"] is False
+    assert report["results"][0]["correct_answer"] == 0.0
+    assert report["results"][0]["tools"] == ["web_search"]
+    assert report["results"][0]["last_agent"] == "WebSearchAgent"
+    assert report["correct_answer_mean"] == report["correct"] / report["scored"]
+    for row in report["results"]:
+        assert row["status"] == "completed"
+        assert row["correct_answer"] in (0.0, 1.0)
+        assert row["tools"] == ["web_search"]
+
+
+def test_custom_judge_replaces_the_overlap_score() -> None:
+    def judge(question: str, expected: str, output: str) -> tuple[float, str]:
+        del question, expected, output
+        return 1.0, "forced"
+
+    report = asyncio.run(run_benchmark("search_agent", provider="local", limit=2, judge=judge))
+    assert report["judge"] == "custom"
+    assert report["model_scores"] is False
+    assert report["correct_answer_mean"] == 1.0
+    assert report["results"][0]["correct_answer"] == 1.0
+    assert report["results"][0]["judge_reason"] == "forced"
+    assert report["results"][0]["recall"] < 0.8
+
+
+def test_openai_provider_uses_the_llm_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("workbench.bench.openai_api_key", lambda: "sk-test")
+
+    async def fake_eval(document, tasks, **kwargs):
+        del kwargs
+        assert document.harness.provider == "openai"
+        assert document.harness.model == "gpt-4o"
+        assert document.harness.temperature == 0.7
+        assert document.node("web").config["search_context_size"] == "high"
+        assert document.node("web").config["instructions"] == "You are an agent that can search the web."
+        rows = []
+        for task in tasks:
+            rows.append(
+                {
+                    "input": task.input,
+                    "output": "stub answer",
+                    "status": "completed",
+                    "passed": False,
+                    "graders": [
+                        {
+                            "name": "correct_answer",
+                            "passed": False,
+                            "detail": "0",
+                            "score": 0.0,
+                            "recall": 0.0,
+                        }
+                    ],
+                    "tools": ["web_search"],
+                    "last_agent": "WebSearchAgent",
+                }
+            )
+        return RunOutcome(
+            status="completed",
+            output=f"0/{len(rows)} passed",
+            report={"passed": 0, "failed": len(rows), "total": len(rows), "results": rows},
+        )
+
+    def fake_judge(question: str, expected: str, output: str) -> tuple[float, str]:
+        assert output == "stub answer"
+        assert expected
+        assert question
+        return 1.0, "matches the sample"
+
+    monkeypatch.setattr("workbench.bench.run_eval", fake_eval)
+    monkeypatch.setattr("workbench.bench.llm_correct_answer", fake_judge)
+    report = asyncio.run(run_benchmark("search_agent", provider="openai", limit=2))
+    assert report["model_scores"] is True
+    assert report["judge"] == "openai:gpt-4o-mini"
+    assert report["model"] == "gpt-4o"
+    assert report["search_context_applied"] is True
+    assert report["correct_answer_mean"] == 1.0
+    assert report["results"][0]["judge_reason"] == "matches the sample"
+
+
+def test_openai_without_a_key_is_refused() -> None:
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        asyncio.run(run_benchmark("search_agent", provider="openai", limit=1))
+
+
+def test_bench_cli_lists_and_runs_locally(tmp_path, capsys) -> None:
+    assert main(["--home", str(tmp_path), "bench"]) == 0
+    listed = capsys.readouterr().out
+    assert "search_agent" in listed
+    assert "evaluate_agents.ipynb" in listed
+
+    assert main(["--home", str(tmp_path), "info"]) == 0
+    assert "search_agent" in capsys.readouterr().out
+
+    assert main(["--home", str(tmp_path), "bench", "missing"]) == 2
+    assert "Unknown benchmark" in capsys.readouterr().err
+
+    assert main(["--home", str(tmp_path), "bench", "search_agent", "--provider", "openai"]) == 1
+    assert "OPENAI_API_KEY" in capsys.readouterr().err
+
+    assert main(["--home", str(tmp_path), "bench", "search_agent", "--limit", "2", "--json"]) == 0
+    payload = capsys.readouterr().out
+    assert '"benchmark": "search_agent"' in payload
+    assert '"model_scores": false' in payload
+    assert '"correct_answer": 0.0' in payload
