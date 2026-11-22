@@ -76,10 +76,12 @@ That notebook builds an Agents SDK `WebSearchAgent` (`WebSearchTool(search_conte
 
 ```bash
 python -m workbench bench search_agent
-OPENAI_API_KEY=sk-... python -m workbench bench search_agent --provider openai
+OPENAI_API_KEY=sk-... python -m workbench bench search_agent --provider openai --budget-usd 2 --limit 5
 ```
 
-`benchmarks/search_agent/tasks.jsonl` is the first 50 rows of the dataset’s current `data.jsonl` (929 rows on the dataset card; the notebook’s saved log printed 934). It is the leading slice the notebook uploads, not a further sample. With no `OPENAI_API_KEY`, the command uses the local deterministic provider and a token-recall stand-in for `correct_answer`. Those numbers are not model scores. `--provider openai` is the run that matches the cookbook judge. `--context-size low|medium|high` changes the hosted tool setting the notebook compares. `--limit N` grades a prefix of the slice.
+Each task records input, cached input, and output tokens for the agent (Agents SDK run usage) and the judge (Chat Completions usage), plus hosted `web_search` calls at $0.01 each. Prices live in `workbench/pricing.py` (OpenAI pricing page, checked 2026-11-22). `--budget-usd` defaults to 2.00. Before a task starts, spend so far plus a per-task reservation is compared with the cap; the rest of the rows are marked skipped and no further model calls are made. `--limit N` grades a prefix of the slice. Local runs record the same fields with a $0 price.
+
+`benchmarks/search_agent/tasks.jsonl` is the first 50 rows of the dataset’s current `data.jsonl` (929 rows on the dataset card; the notebook’s saved log printed 934). It is the leading slice the notebook uploads, not a further sample. With no `OPENAI_API_KEY`, the command uses the local deterministic provider and a token-recall stand-in for `correct_answer`. Those numbers are not model scores. `--provider openai` is the run that matches the cookbook judge. `--context-size low|medium|high` changes the hosted tool setting the notebook compares.
 
 ## What you get
 

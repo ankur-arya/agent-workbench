@@ -26,12 +26,28 @@ from __future__ import annotations
 
 import json
 import os
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
-from workbench.document import EvalTask
+from workbench.document import EvalTask, HarnessSpec
 from workbench.env import openai_api_key
-from workbench.evals import run_eval
+from workbench.evals import grade_outcome
+from workbench.pricing import (
+    PRICING_CHECKED,
+    PRICING_SOURCE,
+    RATES,
+    WEB_SEARCH_USD_PER_CALL,
+    add_usage,
+    can_afford,
+    empty_usage,
+    estimate_task_usd,
+    money,
+    price_tokens,
+    price_web_search,
+    usage_from_chat_completion,
+)
+from workbench.runtime import arun_workflow
 from workbench.templates import get_template
 
 COOKBOOK_URL = (
@@ -43,7 +59,9 @@ DATASET_TOTAL = 929
 JUDGE_MODEL = "gpt-4o-mini"
 COOKBOOK_AGENT_MODEL = "gpt-4o"
 
-Judge = Callable[[str, str, str], tuple[float, str]]
+# (score, reason) or (score, reason, usage dict).
+Judge = Callable[..., tuple]
+DEFAULT_BUDGET_USD = Decimal("2.00")
 
 BENCHMARKS: dict[str, dict[str, str]] = {
     "search_agent": {
@@ -161,7 +179,7 @@ def llm_correct_answer(
     output: str,
     *,
     client: Any | None = None,
-) -> tuple[float, str]:
+) -> tuple[float, str, dict[str, int]]:
     """Call the cookbook-style correct_answer judge. Requires an API key."""
     if client is None:
         key = openai_api_key()
@@ -180,7 +198,8 @@ def llm_correct_answer(
         ],
     )
     text = response.choices[0].message.content or ""
-    return parse_judge_payload(text)
+    score, reason = parse_judge_payload(text)
+    return score, reason, usage_from_chat_completion(getattr(response, "usage", None))
 
 
 async def run_benchmark(
@@ -191,6 +210,7 @@ async def run_benchmark(
     model: str | None = None,
     context_size: str = "high",
     judge: Judge | None = None,
+    budget_usd: Decimal | float | str = DEFAULT_BUDGET_USD,
 ) -> dict[str, Any]:
     if name not in BENCHMARKS:
         known = ", ".join(BENCHMARKS)
@@ -215,42 +235,67 @@ async def run_benchmark(
     elif judge is not None:
         judge_name = "custom"
 
-    tasks = [EvalTask(input=item["question"], reference_answer=item["expected_answer"]) for item in items]
-    outcome = await run_eval(document, tasks)
-    results = list((outcome.report or {}).get("results") or [])
-    if len(results) != len(items):
-        raise RuntimeError(f"Eval returned {len(results)} rows for {len(items)} tasks.")
+    budget = _budget(budget_usd)
+    bill_search = resolved == "openai"
+    priced_judge = judge_model() if judge is not None and bill_search else None
+    estimate = estimate_task_usd(
+        agent_model=chosen_model,
+        judge_model=priced_judge,
+        max_turns=document.harness.max_turns,
+        bill_web_search=bill_search,
+    )
+    spec = _eval_spec(document.harness)
+    spent = Decimal(0)
+    agent_totals = empty_usage()
+    judge_totals = empty_usage()
+    agent_usd_total = Decimal(0)
+    judge_usd_total = Decimal(0)
+    search_calls = 0
+    search_usd = Decimal(0)
     rows: list[dict[str, Any]] = []
     errors = 0
-    for item, result in zip(items, results):
-        lexical = _grader(result, "correct_answer")
-        score = None if lexical is None else lexical.get("score")
-        recall = None if lexical is None else lexical.get("recall")
-        reason = ""
-        error = None
+    skipped = 0
+    stop_for_budget = False
+    for item in items:
+        task = EvalTask(input=item["question"], reference_answer=item["expected_answer"])
+        if stop_for_budget or not can_afford(spent, estimate, budget):
+            stop_for_budget = True
+            skipped += 1
+            rows.append(_skipped_row(item, budget, spent, estimate))
+            continue
+        outcome = await arun_workflow(document, item["question"], harness=spec)
+        graded = grade_outcome(task, outcome)
+        agent_usage = dict(outcome.usage or empty_usage())
+        calls = sum(1 for name in graded.get("tools") or [] if name == "web_search")
+        agent_usd = Decimal(0) if chosen_model == "local" else price_tokens(chosen_model, **_token_kwargs(agent_usage))
+        call_usd = price_web_search(calls, billable=bill_search)
+        judge_usage = empty_usage()
+        judge_usd = Decimal(0)
+        score, recall, reason, error = _score_from_grade(graded)
         if judge is not None:
             try:
-                score, reason = judge(item["question"], item["expected_answer"], str(result.get("output") or ""))
+                judged_score, reason, judge_usage = _judge_parts(
+                    judge(item["question"], item["expected_answer"], str(graded.get("output") or ""))
+                )
             except Exception as exc:
                 error = str(exc)
                 errors += 1
                 score = None
             else:
-                graders = [row for row in result.get("graders") or [] if row.get("name") != "correct_answer"]
-                graders.append(
-                    {
-                        "name": "correct_answer",
-                        "passed": score == 1.0,
-                        "detail": reason or f"{score:.0f}",
-                        "score": score,
-                        "recall": recall,
-                    }
-                )
-                result["graders"] = graders
-                result["passed"] = all(row.get("passed") for row in graders)
-        if error is None and score is None:
+                score = judged_score
+                if priced_judge:
+                    judge_usd = price_tokens(priced_judge, **_token_kwargs(judge_usage))
+        elif error is None and score is None:
             error = "The eval harness did not return a correct_answer score."
             errors += 1
+        task_usd = agent_usd + call_usd + judge_usd
+        spent += task_usd
+        agent_totals = add_usage(agent_totals, agent_usage)
+        judge_totals = add_usage(judge_totals, judge_usage)
+        agent_usd_total += agent_usd
+        judge_usd_total += judge_usd
+        search_calls += calls
+        search_usd += call_usd
         rows.append(
             {
                 "id": item["id"],
@@ -258,21 +303,35 @@ async def run_benchmark(
                 "area": item["area"],
                 "input": item["question"],
                 "expected_answer": item["expected_answer"],
-                "output": result.get("output") or "",
-                "status": result.get("status"),
+                "output": graded.get("output") or "",
+                "status": graded.get("status"),
                 "correct_answer": score,
                 "recall": recall,
                 "judge_reason": reason,
                 "passed": score == 1.0,
-                "tools": list(result.get("tools") or []),
-                "last_agent": result.get("last_agent"),
+                "tools": list(graded.get("tools") or []),
+                "last_agent": graded.get("last_agent"),
                 "error": error,
+                "cost": _cost_block(
+                    usd=task_usd,
+                    usage=add_usage(agent_usage, judge_usage),
+                    web_search_calls=calls,
+                    web_search_usd=call_usd,
+                    agent_model=chosen_model,
+                    agent_usage=agent_usage,
+                    agent_usd=agent_usd,
+                    judge_model=priced_judge or judge_name,
+                    judge_usage=judge_usage,
+                    judge_usd=judge_usd,
+                    budget_remaining=budget - spent,
+                ),
             }
         )
-    scored = [row for row in rows if isinstance(row["correct_answer"], (int, float))]
-    correct = sum(1 for row in scored if row["correct_answer"] == 1.0)
-    mean = (sum(float(row["correct_answer"]) for row in scored) / len(scored)) if scored else None
+    scored_rows = [row for row in rows if isinstance(row["correct_answer"], (int, float))]
+    correct = sum(1 for row in scored_rows if row["correct_answer"] == 1.0)
+    mean = (sum(float(row["correct_answer"]) for row in scored_rows) / len(scored_rows)) if scored_rows else None
     model_scores = resolved == "openai" and judge_name.startswith("openai:")
+    ran = len(rows) - skipped
     return {
         "benchmark": name,
         "source": COOKBOOK_URL,
@@ -290,14 +349,161 @@ async def run_benchmark(
         "judge": judge_name,
         "model_scores": model_scores,
         "search_context_size": context_size,
-        "search_context_applied": resolved == "openai",
+        "search_context_applied": bill_search,
         "temperature": document.harness.temperature,
         "correct_answer_mean": mean,
         "correct": correct,
-        "scored": len(scored),
+        "scored": len(scored_rows),
+        "ran": ran,
+        "skipped": skipped,
         "total": len(rows),
         "errors": errors,
+        "budget_usd": money(budget),
+        "estimate_usd_per_task": money(estimate),
+        "pricing": {
+            "source": PRICING_SOURCE,
+            "checked": PRICING_CHECKED,
+            "web_search_usd_per_call": money(WEB_SEARCH_USD_PER_CALL),
+            "per_million_tokens": {
+                name: {
+                    "input": money(rates.input),
+                    "cached_input": money(rates.cached_input),
+                    "output": money(rates.output),
+                }
+                for name, rates in RATES.items()
+            },
+        },
+        "cost": _cost_block(
+            usd=spent,
+            usage=add_usage(agent_totals, judge_totals),
+            web_search_calls=search_calls,
+            web_search_usd=search_usd,
+            agent_model=chosen_model,
+            agent_usage=agent_totals,
+            agent_usd=agent_usd_total,
+            judge_model=priced_judge or judge_name,
+            judge_usage=judge_totals,
+            judge_usd=judge_usd_total,
+            budget_remaining=budget - spent,
+        ),
         "results": rows,
+    }
+
+
+def _budget(value: Decimal | float | str) -> Decimal:
+    try:
+        budget = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"budget_usd must be a number, got {value!r}") from exc
+    if budget < 0:
+        raise ValueError("budget_usd must be >= 0")
+    return budget
+
+
+def _eval_spec(harness: HarnessSpec) -> HarnessSpec:
+    spec = harness.model_copy(deep=True)
+    spec.session_backend = "none"
+    spec.session_id = None
+    if spec.kind == "eval":
+        spec.kind = spec.eval_mode
+    return spec
+
+
+def _token_kwargs(usage: dict[str, int]) -> dict[str, int]:
+    return {
+        "input_tokens": int(usage.get("input_tokens", 0)),
+        "cached_input_tokens": int(usage.get("cached_input_tokens", 0)),
+        "output_tokens": int(usage.get("output_tokens", 0)),
+    }
+
+
+def _judge_parts(value: Any) -> tuple[float, str, dict[str, int]]:
+    if not isinstance(value, tuple) or len(value) < 2:
+        raise TypeError("Judge must return (score, reason) or (score, reason, usage)")
+    usage = value[2] if len(value) >= 3 and isinstance(value[2], dict) else empty_usage()
+    return float(value[0]), str(value[1]), {**empty_usage(), **usage}
+
+
+def _score_from_grade(graded: dict[str, Any]) -> tuple[float | None, float | None, str, str | None]:
+    lexical = _grader(graded, "correct_answer")
+    if lexical is None:
+        return None, None, "", None
+    return lexical.get("score"), lexical.get("recall"), "", None
+
+
+def _skipped_row(item: dict[str, str], budget: Decimal, spent: Decimal, estimate: Decimal) -> dict[str, Any]:
+    reason = (
+        f"Stopped before this task: spent {money(spent)} USD plus estimate {money(estimate)} USD "
+        f"would exceed budget {money(budget)} USD."
+    )
+    return {
+        "id": item["id"],
+        "category": item["category"],
+        "area": item["area"],
+        "input": item["question"],
+        "expected_answer": item["expected_answer"],
+        "output": "",
+        "status": "skipped",
+        "correct_answer": None,
+        "recall": None,
+        "judge_reason": "",
+        "passed": False,
+        "tools": [],
+        "last_agent": None,
+        "error": None,
+        "skipped_reason": reason,
+        "cost": _cost_block(
+            usd=Decimal(0),
+            usage=empty_usage(),
+            web_search_calls=0,
+            web_search_usd=Decimal(0),
+            agent_model="",
+            agent_usage=empty_usage(),
+            agent_usd=Decimal(0),
+            judge_model="",
+            judge_usage=empty_usage(),
+            judge_usd=Decimal(0),
+            budget_remaining=budget - spent,
+        ),
+    }
+
+
+def _cost_block(
+    *,
+    usd: Decimal,
+    usage: dict[str, int],
+    web_search_calls: int,
+    web_search_usd: Decimal,
+    agent_model: str,
+    agent_usage: dict[str, int],
+    agent_usd: Decimal,
+    judge_model: str,
+    judge_usage: dict[str, int],
+    judge_usd: Decimal,
+    budget_remaining: Decimal,
+) -> dict[str, Any]:
+    return {
+        "usd": money(usd),
+        "budget_remaining_usd": money(budget_remaining),
+        "input_tokens": int(usage.get("input_tokens", 0)),
+        "cached_input_tokens": int(usage.get("cached_input_tokens", 0)),
+        "output_tokens": int(usage.get("output_tokens", 0)),
+        "requests": int(usage.get("requests", 0)),
+        "web_search_calls": web_search_calls,
+        "web_search_usd": money(web_search_usd),
+        "agent": _party_cost(agent_model, agent_usage, agent_usd),
+        "judge": _party_cost(judge_model, judge_usage, judge_usd),
+    }
+
+
+def _party_cost(model: str, usage: dict[str, int], usd: Decimal) -> dict[str, Any]:
+    return {
+        "model": model,
+        "requests": int(usage.get("requests", 0)),
+        "input_tokens": int(usage.get("input_tokens", 0)),
+        "cached_input_tokens": int(usage.get("cached_input_tokens", 0)),
+        "output_tokens": int(usage.get("output_tokens", 0)),
+        "usd": money(usd),
     }
 
 
@@ -318,7 +524,12 @@ def format_report(report: dict[str, Any]) -> str:
     lines.append("")
     for index, row in enumerate(report["results"]):
         score = row["correct_answer"]
-        shown = "error" if score is None else f"{score:.0f}"
+        if row.get("status") == "skipped":
+            shown = "skipped"
+        elif score is None:
+            shown = "error"
+        else:
+            shown = f"{score:.0f}"
         recall = row.get("recall")
         recall_text = "n/a" if not isinstance(recall, (int, float)) else f"{recall:.2f}"
         tools = ",".join(row.get("tools") or []) or "-"
@@ -327,25 +538,50 @@ def format_report(report: dict[str, Any]) -> str:
             f"recall={recall_text}  tools={tools}"
         )
         lines.append(f"    Q: {row['input']}")
-        output = " ".join(str(row.get("output") or "").split())
-        if len(output) > 180:
-            output = output[:177] + "..."
-        lines.append(f"    A: {output}")
+        if row.get("status") != "skipped":
+            output = " ".join(str(row.get("output") or "").split())
+            if len(output) > 180:
+                output = output[:177] + "..."
+            lines.append(f"    A: {output}")
+        cost = row.get("cost") or {}
+        lines.append(
+            f"    cost {cost.get('usd', '0.000000')} USD  "
+            f"in={cost.get('input_tokens', 0)} cached={cost.get('cached_input_tokens', 0)} "
+            f"out={cost.get('output_tokens', 0)}  web_search={cost.get('web_search_calls', 0)}  "
+            f"budget_remaining={cost.get('budget_remaining_usd', report.get('budget_usd'))} USD"
+        )
         if row.get("judge_reason"):
             lines.append(f"    judge: {row['judge_reason']}")
+        if row.get("skipped_reason"):
+            lines.append(f"    skipped: {row['skipped_reason']}")
         if row.get("error"):
             lines.append(f"    error: {row['error']}")
     mean = report["correct_answer_mean"]
     mean_text = "n/a" if mean is None else f"{mean:.2f}"
+    cost = report.get("cost") or {}
     lines.append("")
     lines.append(
         f"correct_answer mean: {mean_text} "
-        f"({report['correct']}/{report['scored']} correct, {report['total']} tasks)"
+        f"({report['correct']}/{report['scored']} correct, {report['ran']} ran, "
+        f"{report.get('skipped', 0)} skipped, {report['total']} tasks)"
+    )
+    lines.append(
+        f"cost {cost.get('usd', '0.000000')} USD  "
+        f"in={cost.get('input_tokens', 0)} cached={cost.get('cached_input_tokens', 0)} "
+        f"out={cost.get('output_tokens', 0)}  web_search={cost.get('web_search_calls', 0)} "
+        f"({cost.get('web_search_usd', '0.000000')} USD)"
+    )
+    lines.append(
+        f"budget {report.get('budget_usd')} USD  "
+        f"remaining {cost.get('budget_remaining_usd')} USD  "
+        f"estimate_per_task {report.get('estimate_usd_per_task')} USD"
     )
     if not report["model_scores"]:
         lines.append("These scores are not real model scores.")
-        lines.append("Run against OpenAI with:")
-        lines.append("  OPENAI_API_KEY=... python -m workbench bench search_agent --provider openai")
+        lines.append("Run against OpenAI with a budget cap:")
+        lines.append(
+            "  OPENAI_API_KEY=... python -m workbench bench search_agent --provider openai --budget-usd 2 --limit 5"
+        )
     return "\n".join(lines)
 
 

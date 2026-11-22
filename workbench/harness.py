@@ -40,6 +40,7 @@ class HarnessResult:
     pending: dict[str, Any] | None = None
     error: str | None = None
     deltas: str = ""
+    usage: dict[str, int] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -228,6 +229,7 @@ async def execute(
                     "prompt": "Approve this tool call?",
                 },
                 deltas="".join(deltas),
+                usage=_sdk_usage(result),
             )
 
     output = _stringify(result.final_output)
@@ -237,6 +239,7 @@ async def execute(
         events=_events(result),
         last_agent=result.last_agent.name if result.last_agent else agent.name,
         deltas="".join(deltas),
+        usage=_sdk_usage(result),
     )
 
 
@@ -307,6 +310,14 @@ def _events(result: Any) -> list[dict[str, Any]]:
     if result.last_agent is not None:
         events.append({"type": "agent", "name": result.last_agent.name, "detail": "finished"})
     return events
+
+
+def _sdk_usage(result: Any) -> dict[str, int]:
+    """Agents SDK aggregate usage for this run, including resumed state."""
+    from workbench.pricing import usage_from_sdk
+
+    wrapper = getattr(result, "context_wrapper", None)
+    return usage_from_sdk(getattr(wrapper, "usage", None) if wrapper is not None else None)
 
 
 def _stringify(value: Any) -> str:

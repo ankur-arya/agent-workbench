@@ -79,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("name", nargs="?", default=None, help="Benchmark id. Omit to list benchmarks.")
     bench.add_argument("--provider", choices=["auto", "local", "openai"], default="auto")
     bench.add_argument("--limit", type=int, default=None, help="Grade only the first N dataset rows.")
+    bench.add_argument(
+        "--budget-usd",
+        type=float,
+        default=2.0,
+        help="Stop before a task whose conservative estimate would exceed this spend. Default: 2.00.",
+    )
     bench.add_argument("--model", default=None, help="Agent model when the provider is openai. Default: gpt-4o.")
     bench.add_argument(
         "--context-size",
@@ -254,6 +260,7 @@ def _bench(args: argparse.Namespace) -> int:
                 limit=args.limit,
                 model=args.model,
                 context_size=args.context_size,
+                budget_usd=args.budget_usd,
             )
         )
     except (RuntimeError, ValueError, FileNotFoundError, KeyError) as exc:

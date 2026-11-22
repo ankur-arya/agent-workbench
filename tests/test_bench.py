@@ -113,7 +113,7 @@ def test_parse_judge_payload_accepts_binary_json() -> None:
         parse_judge_payload('{"correct_answer": 0.5}')
 
 
-def test_llm_judge_reads_json_from_the_client() -> None:
+def test_llm_judge_reads_json_and_usage_from_the_client() -> None:
     class Message:
         def __init__(self, content: str) -> None:
             self.content = content
@@ -122,9 +122,18 @@ def test_llm_judge_reads_json_from_the_client() -> None:
         def __init__(self, content: str) -> None:
             self.message = Message(content)
 
+    class Details:
+        cached_tokens = 3
+
+    class Usage:
+        prompt_tokens = 40
+        completion_tokens = 9
+        prompt_tokens_details = Details()
+
     class Response:
         def __init__(self, content: str) -> None:
             self.choices = [Choice(content)]
+            self.usage = Usage()
 
     class Completions:
         def __init__(self) -> None:
@@ -143,9 +152,15 @@ def test_llm_judge_reads_json_from_the_client() -> None:
             self.chat = Chat()
 
     client = Client()
-    score, reason = llm_correct_answer("Where?", "Budapest", "Budapest, Hungary.", client=client)
+    score, reason, usage = llm_correct_answer("Where?", "Budapest", "Budapest, Hungary.", client=client)
     assert score == 1.0
     assert reason == "covered"
+    assert usage == {
+        "requests": 1,
+        "input_tokens": 40,
+        "cached_input_tokens": 3,
+        "output_tokens": 9,
+    }
     sent = client.chat.completions.kwargs
     assert sent["model"] == "gpt-4o-mini"
     assert sent["temperature"] == 0
@@ -166,10 +181,18 @@ def test_local_benchmark_scores_every_cookbook_row() -> None:
     assert report["results"][0]["tools"] == ["web_search"]
     assert report["results"][0]["last_agent"] == "WebSearchAgent"
     assert report["correct_answer_mean"] == report["correct"] / report["scored"]
+    assert report["budget_usd"] == "2.000000"
+    assert report["cost"]["usd"] == "0.000000"
+    assert report["cost"]["web_search_usd"] == "0.000000"
+    assert report["cost"]["web_search_calls"] == 50
+    assert report["cost"]["budget_remaining_usd"] == "2.000000"
+    assert report["skipped"] == 0
+    assert report["results"][0]["cost"]["web_search_calls"] == 1
     for row in report["results"]:
         assert row["status"] == "completed"
         assert row["correct_answer"] in (0.0, 1.0)
         assert row["tools"] == ["web_search"]
+        assert row["cost"]["usd"] == "0.000000"
 
 
 def test_custom_judge_replaces_the_overlap_score() -> None:
@@ -189,55 +212,116 @@ def test_custom_judge_replaces_the_overlap_score() -> None:
 def test_openai_provider_uses_the_llm_judge(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("workbench.bench.openai_api_key", lambda: "sk-test")
 
-    async def fake_eval(document, tasks, **kwargs):
-        del kwargs
+    async def fake_workflow(document, user_input, **kwargs):
+        del user_input, kwargs
         assert document.harness.provider == "openai"
         assert document.harness.model == "gpt-4o"
         assert document.harness.temperature == 0.7
         assert document.node("web").config["search_context_size"] == "high"
         assert document.node("web").config["instructions"] == "You are an agent that can search the web."
-        rows = []
-        for task in tasks:
-            rows.append(
-                {
-                    "input": task.input,
-                    "output": "stub answer",
-                    "status": "completed",
-                    "passed": False,
-                    "graders": [
-                        {
-                            "name": "correct_answer",
-                            "passed": False,
-                            "detail": "0",
-                            "score": 0.0,
-                            "recall": 0.0,
-                        }
-                    ],
-                    "tools": ["web_search"],
-                    "last_agent": "WebSearchAgent",
-                }
-            )
         return RunOutcome(
             status="completed",
-            output=f"0/{len(rows)} passed",
-            report={"passed": 0, "failed": len(rows), "total": len(rows), "results": rows},
+            output="stub answer",
+            events=[{"type": "tool", "name": "web_search", "detail": "{}"}],
+            last_agent="WebSearchAgent",
+            usage={
+                "requests": 2,
+                "input_tokens": 100,
+                "cached_input_tokens": 40,
+                "output_tokens": 20,
+            },
         )
 
-    def fake_judge(question: str, expected: str, output: str) -> tuple[float, str]:
+    def fake_judge(question: str, expected: str, output: str):
         assert output == "stub answer"
         assert expected
         assert question
-        return 1.0, "matches the sample"
+        return 1.0, "matches the sample", {"requests": 1, "input_tokens": 30, "cached_input_tokens": 10, "output_tokens": 8}
 
-    monkeypatch.setattr("workbench.bench.run_eval", fake_eval)
+    monkeypatch.setattr("workbench.bench.arun_workflow", fake_workflow)
     monkeypatch.setattr("workbench.bench.llm_correct_answer", fake_judge)
-    report = asyncio.run(run_benchmark("search_agent", provider="openai", limit=2))
+    report = asyncio.run(run_benchmark("search_agent", provider="openai", limit=2, budget_usd="2"))
     assert report["model_scores"] is True
     assert report["judge"] == "openai:gpt-4o-mini"
     assert report["model"] == "gpt-4o"
     assert report["search_context_applied"] is True
     assert report["correct_answer_mean"] == 1.0
     assert report["results"][0]["judge_reason"] == "matches the sample"
+    assert report["results"][0]["cost"]["agent"]["input_tokens"] == 100
+    assert report["results"][0]["cost"]["agent"]["cached_input_tokens"] == 40
+    assert report["results"][0]["cost"]["judge"]["output_tokens"] == 8
+    assert report["results"][0]["cost"]["web_search_calls"] == 1
+    assert report["results"][0]["cost"]["web_search_usd"] == "0.010000"
+    assert report["ran"] == 2
+    assert report["skipped"] == 0
+
+
+def test_budget_stops_before_the_next_task_and_never_spends_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("workbench.bench.openai_api_key", lambda: "sk-test")
+    calls: list[str] = []
+
+    async def fake_workflow(document, user_input, **kwargs):
+        del document, kwargs
+        calls.append(user_input)
+        return RunOutcome(
+            status="completed",
+            output="priced answer",
+            events=[{"type": "tool", "name": "web_search", "detail": "{}"}],
+            last_agent="WebSearchAgent",
+            usage={"requests": 1, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0},
+        )
+
+    def fake_judge(question: str, expected: str, output: str):
+        del question, expected, output
+        return 0.0, "no", {"requests": 1, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+
+    monkeypatch.setattr("workbench.bench.arun_workflow", fake_workflow)
+    from decimal import Decimal
+
+    from workbench.pricing import estimate_task_usd
+
+    estimate = estimate_task_usd(
+        agent_model="gpt-4o",
+        judge_model="gpt-4o-mini",
+        max_turns=10,
+        bill_web_search=True,
+    )
+    # One hosted web search is $0.01, under the reservation, so the second
+    # task's reservation no longer fits in a budget equal to one estimate.
+    report = asyncio.run(
+        run_benchmark(
+            "search_agent",
+            provider="openai",
+            limit=4,
+            budget_usd=estimate,
+            judge=fake_judge,
+        )
+    )
+    assert calls and len(calls) == 1
+    assert report["ran"] == 1
+    assert report["skipped"] == 3
+    assert [row["status"] for row in report["results"]] == ["completed", "skipped", "skipped", "skipped"]
+    assert report["results"][1]["correct_answer"] is None
+    assert "budget" in report["results"][1]["skipped_reason"]
+    assert Decimal(report["cost"]["usd"]) == Decimal("0.010000")
+    assert Decimal(report["cost"]["usd"]) <= Decimal(report["budget_usd"])
+    assert report["results"][0]["cost"]["web_search_calls"] == 1
+    assert report["cost"]["input_tokens"] == 0
+
+    blocked = asyncio.run(
+        run_benchmark(
+            "search_agent",
+            provider="openai",
+            limit=3,
+            budget_usd=0,
+            judge=fake_judge,
+        )
+    )
+    assert len(calls) == 1
+    assert blocked["ran"] == 0
+    assert blocked["skipped"] == 3
+    assert blocked["cost"]["usd"] == "0.000000"
+    assert all(row["status"] == "skipped" for row in blocked["results"])
 
 
 def test_openai_without_a_key_is_refused() -> None:
@@ -265,3 +349,5 @@ def test_bench_cli_lists_and_runs_locally(tmp_path, capsys) -> None:
     assert '"benchmark": "search_agent"' in payload
     assert '"model_scores": false' in payload
     assert '"correct_answer": 0.0' in payload
+    assert '"budget_usd": "2.000000"' in payload
+    assert '"budget_remaining_usd"' in payload
